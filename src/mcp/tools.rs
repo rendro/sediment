@@ -354,6 +354,60 @@ async fn execute_store(
         ));
     }
 
+    // Validate input field sizes
+    const MAX_TITLE_LENGTH: usize = 10_000;
+    const MAX_TAG_LENGTH: usize = 1_000;
+    const MAX_TAGS_COUNT: usize = 100;
+    const MAX_SOURCE_LENGTH: usize = 10_000;
+    const MAX_METADATA_BYTES: usize = 100_000;
+
+    if let Some(ref title) = params.title {
+        if title.len() > MAX_TITLE_LENGTH {
+            return CallToolResult::error(format!(
+                "Title too large: {} bytes (max {})",
+                title.len(),
+                MAX_TITLE_LENGTH
+            ));
+        }
+    }
+    if let Some(ref tags) = params.tags {
+        if tags.len() > MAX_TAGS_COUNT {
+            return CallToolResult::error(format!(
+                "Too many tags: {} (max {})",
+                tags.len(),
+                MAX_TAGS_COUNT
+            ));
+        }
+        for tag in tags {
+            if tag.len() > MAX_TAG_LENGTH {
+                return CallToolResult::error(format!(
+                    "Tag too large: {} bytes (max {})",
+                    tag.len(),
+                    MAX_TAG_LENGTH
+                ));
+            }
+        }
+    }
+    if let Some(ref source) = params.source {
+        if source.len() > MAX_SOURCE_LENGTH {
+            return CallToolResult::error(format!(
+                "Source too large: {} bytes (max {})",
+                source.len(),
+                MAX_SOURCE_LENGTH
+            ));
+        }
+    }
+    if let Some(ref metadata) = params.metadata {
+        let meta_size = metadata.to_string().len();
+        if meta_size > MAX_METADATA_BYTES {
+            return CallToolResult::error(format!(
+                "Metadata too large: {} bytes (max {})",
+                meta_size,
+                MAX_METADATA_BYTES
+            ));
+        }
+    }
+
     // Parse scope
     let scope = params
         .scope
@@ -713,6 +767,16 @@ async fn execute_recall(
         },
         None => return CallToolResult::error("Missing parameters"),
     };
+
+    // Reject oversized queries to prevent OOM in the embedder
+    const MAX_QUERY_BYTES: usize = 100_000;
+    if params.query.len() > MAX_QUERY_BYTES {
+        return CallToolResult::error(format!(
+            "Query too large: {} bytes (max {} bytes)",
+            params.query.len(),
+            MAX_QUERY_BYTES
+        ));
+    }
 
     let limit = params.limit.unwrap_or(5).min(100);
     let min_similarity = params.min_similarity.unwrap_or(0.3);
