@@ -9,7 +9,9 @@ use std::sync::Arc;
 /// Sanitize a string value for use in LanceDB SQL filter expressions
 /// by escaping backslashes and single quotes to prevent injection attacks.
 fn sanitize_sql_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "''")
+    s.replace('\0', "")
+        .replace('\\', "\\\\")
+        .replace('\'', "''")
 }
 
 use arrow_array::{
@@ -1384,6 +1386,13 @@ mod tests {
         assert_eq!(sanitize_sql_string("it's"), "it''s");
         assert_eq!(sanitize_sql_string(r"a\'b"), r"a\\''b");
         assert_eq!(sanitize_sql_string(r"path\to\file"), r"path\\to\\file");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_strips_null_bytes() {
+        assert_eq!(sanitize_sql_string("abc\0def"), "abcdef");
+        assert_eq!(sanitize_sql_string("\0' OR 1=1 --"), "'' OR 1=1 --");
+        assert_eq!(sanitize_sql_string("clean"), "clean");
     }
 
     #[test]

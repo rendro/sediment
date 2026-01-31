@@ -81,12 +81,38 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
     {
         let stdin = io::stdin();
         let mut stdout = io::stdout();
-        let reader = stdin.lock();
+        let mut reader = stdin.lock();
+
+        // Maximum line size to prevent OOM from a malicious client sending
+        // a single huge line without a newline character.
+        const MAX_LINE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
         tracing::info!("MCP server ready, waiting for requests...");
 
-        for line in reader.lines() {
-            let line = line.context("Failed to read line")?;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes_read = reader.read_line(&mut line).context("Failed to read line")?;
+            if bytes_read == 0 {
+                break; // EOF
+            }
+
+            if line.len() > MAX_LINE_BYTES {
+                tracing::error!(
+                    "Rejecting oversized request: {} bytes (max {})",
+                    line.len(),
+                    MAX_LINE_BYTES
+                );
+                let response = Response::error(
+                    None,
+                    INVALID_REQUEST,
+                    "Request too large",
+                );
+                let response_json = serde_json::to_string(&response)?;
+                writeln!(stdout, "{}", response_json)?;
+                stdout.flush()?;
+                continue;
+            }
 
             if line.trim().is_empty() {
                 continue;
