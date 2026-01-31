@@ -274,15 +274,15 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
                 ctx_ref.embedder.clone(),
             )
             .await
-            .map_err(|e| format!("Failed to open database: {}", e))?;
+            .map_err(|e| sanitize_err("Failed to open database", e))?;
 
             // Open access tracker
             let tracker = AccessTracker::open(&ctx_ref.access_db_path)
-                .map_err(|e| format!("Failed to open access tracker: {}", e))?;
+                .map_err(|e| sanitize_err("Failed to open access tracker", e))?;
 
             // Open graph store (shares access.db)
             let graph = GraphStore::open(&ctx_ref.access_db_path)
-                .map_err(|e| format!("Failed to open graph store: {}", e))?;
+                .map_err(|e| sanitize_err("Failed to open graph store", e))?;
 
             let result = match name_ref {
                 "store" => execute_store(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
@@ -307,7 +307,10 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
 
     match result {
         Ok(call_result) => call_result,
-        Err(e) => CallToolResult::error(format!("Operation failed after retries: {}", e)),
+        Err(e) => {
+            tracing::error!("Operation failed after retries: {}", e);
+            CallToolResult::error("Operation failed after retries")
+        }
     }
 }
 
@@ -404,7 +407,7 @@ async fn execute_store(
                 ));
             }
             Err(e) => {
-                return CallToolResult::error(format!("Failed to look up item for replace: {}", e));
+                return sanitized_error("Failed to look up item for replace", e);
             }
         }
     } else {
@@ -504,10 +507,9 @@ async fn execute_store(
                     // Compensating action: remove the new item since replace failed
                     let _ = db.delete_item(&new_id).await;
                     let _ = graph.remove_node(&new_id);
-                    return CallToolResult::error(format!(
-                        "Replace failed during edge transfer: {}. Original item preserved.",
-                        e
-                    ));
+                    return CallToolResult::error(
+                        "Replace failed during edge transfer. Original item preserved.",
+                    );
                 }
                 // Create SUPERSEDES edge (non-critical, continue on failure)
                 if let Err(e) = graph.add_supersedes_edge(&new_id, old_id) {
@@ -584,7 +586,7 @@ async fn execute_store(
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e)),
             )
         }
-        Err(e) => CallToolResult::error(format!("Failed to store: {}", e)),
+        Err(e) => sanitized_error("Failed to store item", e),
     }
 }
 
@@ -788,7 +790,10 @@ async fn execute_recall(
     let recall_result =
         match recall_pipeline(db, tracker, graph, &params.query, limit, filters, &config).await {
             Ok(r) => r,
-            Err(e) => return CallToolResult::error(e),
+            Err(e) => {
+                tracing::error!("Recall failed: {}", e);
+                return CallToolResult::error("Search failed");
+            }
         };
 
     if recall_result.results.is_empty() {
@@ -1015,7 +1020,7 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
                 )
             }
         }
-        Err(e) => CallToolResult::error(format!("Failed to list items: {}", e)),
+        Err(e) => sanitized_error("Failed to list items", e),
     }
 }
 
@@ -1048,7 +1053,7 @@ async fn execute_forget(
             }
             Ok(None) => return CallToolResult::error(format!("Item not found: {}", params.id)),
             Err(e) => {
-                return CallToolResult::error(format!("Failed to look up item: {}", e));
+                return sanitized_error("Failed to look up item", e);
             }
         }
     }
@@ -1070,7 +1075,7 @@ async fn execute_forget(
             )
         }
         Ok(false) => CallToolResult::error(format!("Item not found: {}", params.id)),
-        Err(e) => CallToolResult::error(format!("Failed to delete: {}", e)),
+        Err(e) => sanitized_error("Failed to delete item", e),
     }
 }
 
@@ -1090,7 +1095,7 @@ async fn execute_connections(
     // Verify item exists
     match db.get_item(&params.id).await {
         Ok(None) => return CallToolResult::error(format!("Item not found: {}", params.id)),
-        Err(e) => return CallToolResult::error(format!("Failed to get item: {}", e)),
+        Err(e) => return sanitized_error("Failed to get item", e),
         Ok(Some(_)) => {}
     }
 
@@ -1133,11 +1138,24 @@ async fn execute_connections(
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e)),
             )
         }
-        Err(e) => CallToolResult::error(format!("Failed to get connections: {}", e)),
+        Err(e) => sanitized_error("Failed to get connections", e),
     }
 }
 
 // ========== Utilities ==========
+
+/// Log a detailed internal error and return a sanitized message to the MCP client.
+/// This prevents leaking file paths, database internals, or OS details.
+fn sanitized_error(context: &str, err: impl std::fmt::Display) -> CallToolResult {
+    tracing::error!("{}: {}", context, err);
+    CallToolResult::error(context.to_string())
+}
+
+/// Like `sanitized_error` but returns a String for use inside `map_err` chains.
+fn sanitize_err(context: &str, err: impl std::fmt::Display) -> String {
+    tracing::error!("{}: {}", context, err);
+    context.to_string()
+}
 
 fn truncate(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
