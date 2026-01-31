@@ -67,6 +67,9 @@ impl Embedder {
             .map_err(|e| SedimentError::Tokenizer(format!("Failed to set truncation: {}", e)))?;
 
         // Load model weights
+        // SAFETY: The safetensors files are SHA-256 verified against hardcoded hashes
+        // (see verify_all_model_files), ensuring they are valid safetensors format.
+        // Memory-mapping valid safetensors files is safe per the candle API contract.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[model_path], DTYPE, &device).map_err(|e| {
                 SedimentError::ModelLoading(format!("Failed to load weights: {}", e))
@@ -89,7 +92,10 @@ impl Embedder {
     /// Embed a single text
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let embeddings = self.embed_batch(&[text])?;
-        Ok(embeddings.into_iter().next().unwrap())
+        Ok(embeddings
+            .into_iter()
+            .next()
+            .expect("embed_batch with non-empty input always returns at least one embedding"))
     }
 
     /// Embed multiple texts at once
