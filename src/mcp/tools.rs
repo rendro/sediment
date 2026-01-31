@@ -333,6 +333,16 @@ async fn execute_store(
         None => return CallToolResult::error("Missing parameters"),
     };
 
+    // Reject oversized content to prevent OOM during embedding/chunking (1MB limit)
+    const MAX_CONTENT_BYTES: usize = 1_000_000;
+    if params.content.len() > MAX_CONTENT_BYTES {
+        return CallToolResult::error(format!(
+            "Content too large: {} bytes (max {} bytes)",
+            params.content.len(),
+            MAX_CONTENT_BYTES
+        ));
+    }
+
     // Parse scope
     let scope = params
         .scope
@@ -355,23 +365,18 @@ async fn execute_store(
         None
     };
 
-    // Handle replace: delete the existing item first, record provenance
+    // Validate that the item to replace exists (actual deletion deferred until after store)
     let replaced_id = if let Some(ref replace_id) = params.replace {
-        match db.delete_item(replace_id).await {
-            Ok(true) => {
-                // Record validation for the new item being stored
-                let now = chrono::Utc::now().timestamp();
-                let _ = tracker.record_validation(replace_id, now);
-                Some(replace_id.clone())
-            }
-            Ok(false) => {
+        match db.get_item(replace_id).await {
+            Ok(Some(_)) => Some(replace_id.clone()),
+            Ok(None) => {
                 return CallToolResult::error(format!(
                     "Cannot replace: item not found: {}",
                     replace_id
                 ));
             }
             Err(e) => {
-                return CallToolResult::error(format!("Failed to delete item for replace: {}", e));
+                return CallToolResult::error(format!("Failed to look up item for replace: {}", e));
             }
         }
     } else {
@@ -452,9 +457,12 @@ async fn execute_store(
             let project_id = db.project_id().map(|s| s.to_string());
             let _ = graph.add_node(&new_id, project_id.as_deref(), now);
 
-            // Create SUPERSEDES edge if replacing
+            // Complete replace: now that the new item is stored, delete the old one
+            // (store-before-delete ensures no data loss on crash)
             if let Some(ref old_id) = replaced_id {
-                // The old node might still exist in graph; create edge then remove
+                let _ = db.delete_item(old_id).await;
+                let now_ts = chrono::Utc::now().timestamp();
+                let _ = tracker.record_validation(old_id, now_ts);
                 let _ = graph.add_supersedes_edge(&new_id, old_id);
                 let _ = graph.remove_node(old_id);
             }

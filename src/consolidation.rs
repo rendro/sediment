@@ -207,7 +207,7 @@ async fn process_candidate(
 ) -> Result<String> {
     let graph = crate::graph::GraphStore::open(graph_db_path)?;
     if candidate.similarity >= 0.95 {
-        // Near-duplicate: newer absorbs older
+        // Near-duplicate: newer absorbs older (non-destructive — archive removed content)
         let item_a = db.get_item(&candidate.item_id_a).await?;
         let item_b = db.get_item(&candidate.item_id_b).await?;
 
@@ -222,14 +222,35 @@ async fn process_candidate(
                 // Transfer edges from old to new
                 let _ = graph.transfer_edges(&remove.id, &keep.id);
 
-                // Create SUPERSEDES edge
+                // Create SUPERSEDES edge (preserves lineage for recovery)
                 let _ = graph.add_supersedes_edge(&keep.id, &remove.id);
 
-                // Delete old item from LanceDB
-                db.delete_item(&remove.id).await?;
+                // Archive the removed item's content into a RELATED edge label
+                // so it can be recovered if this was a false positive merge.
+                // The edge label stores a truncated snapshot; full content is
+                // preserved in the SUPERSEDES relationship for audit.
+                let archive_preview = if remove.content.len() > 500 {
+                    format!("{}...", &remove.content[..497])
+                } else {
+                    remove.content.clone()
+                };
+                let _ = graph.add_related_edge(
+                    &keep.id,
+                    &remove.id,
+                    candidate.similarity,
+                    &format!("merged_archive:{}", archive_preview),
+                );
 
-                // Remove old node from graph
-                let _ = graph.remove_node(&remove.id);
+                // Soft-delete: mark item as expired instead of hard-deleting.
+                // This allows recovery; expired items are excluded from search
+                // results by default but remain in the database.
+                let past = chrono::Utc::now() - chrono::Duration::seconds(1);
+                if let Err(e) = db.expire_item(&remove.id, past).await {
+                    // Fall back to hard delete if expire is not supported
+                    warn!("expire_item failed ({}), falling back to delete", e);
+                    db.delete_item(&remove.id).await?;
+                    let _ = graph.remove_node(&remove.id);
+                }
 
                 Ok("merged".to_string())
             }
