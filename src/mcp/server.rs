@@ -111,10 +111,22 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
                     line.len(),
                     MAX_LINE_BYTES
                 );
-                // Drain remaining bytes until newline or EOF to resync the stream
-                let mut drain = Vec::new();
+                // Drain remaining bytes until newline or EOF to resync the stream.
+                // Use a fixed-size buffer to avoid unbounded allocation from a
+                // malicious client that never sends a newline.
                 if !line.ends_with('\n') {
-                    let _ = reader.read_until(b'\n', &mut drain);
+                    let mut drain_buf = [0u8; 8192];
+                    loop {
+                        match reader.read(&mut drain_buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if drain_buf[..n].contains(&b'\n') {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 }
                 let response = Response::error(
                     None,
@@ -131,7 +143,10 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
                 continue;
             }
 
-            tracing::debug!("Received: {}", line);
+            tracing::debug!("Received: ({} bytes) {}",
+                line.len(),
+                if line.len() > 200 { &line[..200] } else { &line }
+            );
 
             // Handle request and get optional response (notifications don't get responses)
             if let Some(response) = handle_request(&rt, &ctx, &line) {
@@ -225,14 +240,16 @@ fn handle_initialize(id: Option<Value>) -> Response {
         },
     };
 
-    Response::success(id, serde_json::to_value(result).unwrap())
+    // InitializeResult is a simple struct; serialization is infallible.
+    Response::success(id, serde_json::to_value(result).expect("InitializeResult serialization"))
 }
 
 /// Handle tools/list request
 fn handle_list_tools(id: Option<Value>) -> Response {
     let result = ListToolsResult { tools: get_tools() };
 
-    Response::success(id, serde_json::to_value(result).unwrap())
+    // ListToolsResult is a simple struct; serialization is infallible.
+    Response::success(id, serde_json::to_value(result).expect("ListToolsResult serialization"))
 }
 
 /// Handle tools/call request
@@ -276,14 +293,16 @@ fn handle_call_tool(
         if state.count > MAX_CALLS_PER_MINUTE {
             let result =
                 super::protocol::CallToolResult::error("Rate limit exceeded, try again later");
-            return Response::success(id, serde_json::to_value(result).unwrap());
+            // CallToolResult is a simple struct; serialization is infallible.
+            return Response::success(id, serde_json::to_value(result).expect("CallToolResult serialization"));
         }
     }
 
     // Execute tool async with fresh DB connection and retry logic
     let result = rt.block_on(execute_tool(ctx, &params.name, params.arguments));
 
-    Response::success(id, serde_json::to_value(result).unwrap())
+    // CallToolResult is a simple struct; serialization is infallible.
+    Response::success(id, serde_json::to_value(result).expect("CallToolResult serialization"))
 }
 
 /// Handle ping request

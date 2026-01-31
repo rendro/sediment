@@ -24,6 +24,13 @@ fn sanitize_sql_string(s: &str) -> String {
         .replace("/*", "")
 }
 
+/// Validate that a string looks like a valid item/project ID (UUID hex + hyphens).
+/// Returns true if the string only contains safe characters for SQL interpolation.
+/// Use this as an additional guard before `sanitize_sql_string` for ID fields.
+fn is_valid_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
 use arrow_array::{
     Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch,
     RecordBatchIterator, StringArray,
@@ -715,6 +722,9 @@ impl Database {
 
     /// Get an item by ID
     pub async fn get_item(&self, id: &str) -> Result<Option<Item>> {
+        if !is_valid_id(id) {
+            return Ok(None);
+        }
         let table = match &self.items_table {
             Some(t) => t,
             None => return Ok(None),
@@ -754,8 +764,12 @@ impl Database {
 
         let quoted: Vec<String> = ids
             .iter()
+            .filter(|id| is_valid_id(id))
             .map(|id| format!("'{}'", sanitize_sql_string(id)))
             .collect();
+        if quoted.is_empty() {
+            return Ok(Vec::new());
+        }
         let filter = format!("id IN ({})", quoted.join(", "));
 
         let results = table
@@ -782,6 +796,9 @@ impl Database {
     /// Uses delete-then-insert because both rows share the same ID. If the
     /// re-insert fails, retries up to 3 times to avoid data loss.
     pub async fn expire_item(&self, id: &str, expires_at: chrono::DateTime<Utc>) -> Result<()> {
+        if !is_valid_id(id) {
+            return Err(SedimentError::Database(format!("Invalid item ID")));
+        }
         let table = match &self.items_table {
             Some(t) => t,
             None => return Err(SedimentError::Database("Items table not found".to_string())),
@@ -846,6 +863,9 @@ impl Database {
     /// Delete an item and its chunks.
     /// Returns `true` if the item existed, `false` if it was not found.
     pub async fn delete_item(&self, id: &str) -> Result<bool> {
+        if !is_valid_id(id) {
+            return Ok(false);
+        }
         // Check if item exists first
         let table = match &self.items_table {
             Some(t) => t,
@@ -1445,6 +1465,20 @@ mod tests {
         assert_eq!(sanitize_sql_string(""), "");
         // Only special chars
         assert_eq!(sanitize_sql_string("\0;\0"), "");
+    }
+
+    #[test]
+    fn test_is_valid_id() {
+        // Valid UUIDs
+        assert!(is_valid_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_valid_id("abcdef0123456789"));
+        // Invalid
+        assert!(!is_valid_id(""));
+        assert!(!is_valid_id("'; DROP TABLE items;--"));
+        assert!(!is_valid_id("hello world"));
+        assert!(!is_valid_id("abc\0def"));
+        // Too long
+        assert!(!is_valid_id(&"a".repeat(65)));
     }
 
     #[test]
