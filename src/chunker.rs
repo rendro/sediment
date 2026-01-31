@@ -83,8 +83,9 @@ pub fn chunk_content(
     content_type: ContentType,
     config: &ChunkingConfig,
 ) -> Vec<ChunkResult> {
-    // Don't chunk if content is below threshold
-    if content.len() < config.min_chunk_threshold {
+    // Don't chunk if content is below threshold (use char count, not byte length)
+    let char_count = content.chars().count();
+    if char_count < config.min_chunk_threshold {
         return vec![ChunkResult::new(content.to_string(), 0, content.len())];
     }
 
@@ -315,6 +316,15 @@ fn split_by_chars(
             actual_end
         };
 
+        // Ensure actual_end is on a valid UTF-8 char boundary
+        let actual_end = {
+            let mut e = actual_end;
+            while e < text.len() && !text.is_char_boundary(e) {
+                e += 1;
+            }
+            e
+        };
+
         chunks.push(
             ChunkResult::new(
                 text[start..actual_end].to_string(),
@@ -325,8 +335,15 @@ fn split_by_chars(
         );
 
         // Next chunk starts after this one, minus overlap
-        // But ensure we always make progress
+        // But ensure we always make progress and land on a char boundary
         let next_start = actual_end.saturating_sub(effective_overlap);
+        let next_start = {
+            let mut s = next_start;
+            while s < text.len() && !text.is_char_boundary(s) {
+                s += 1;
+            }
+            s
+        };
         start = if next_start <= start {
             actual_end // No overlap if it would cause no progress
         } else {
@@ -1288,6 +1305,49 @@ database:
 
         // Should have chunks for server and database sections
         assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_content_threshold_uses_chars_not_bytes() {
+        // Bug #4: chunker threshold should use char count, not byte length
+        // 999 4-byte emoji chars = 999 chars but 3996 bytes
+        let content: String = "😀".repeat(999);
+        assert_eq!(content.chars().count(), 999);
+        assert_eq!(content.len(), 3996);
+
+        let config = ChunkingConfig::default(); // min_chunk_threshold: 1000
+        let chunks = chunk_content(&content, ContentType::Text, &config);
+        // 999 chars < 1000 threshold, so should NOT chunk
+        assert_eq!(
+            chunks.len(),
+            1,
+            "Should not chunk content below char threshold"
+        );
+    }
+
+    #[test]
+    fn test_split_by_chars_multibyte_no_panic() {
+        // Bug #5: split_by_chars must not panic on multi-byte UTF-8
+        let content: String = "日".repeat(2000); // 3 bytes each
+        // Should not panic
+        let chunks = split_by_chars(&content, 500, 0, None, 50);
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            // All chunks should be valid UTF-8 (they are Strings, so this is guaranteed
+            // if we didn't panic)
+            assert!(!chunk.content.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_split_by_chars_mixed_multibyte() {
+        // Mix of ASCII and multi-byte chars
+        let content = "Hello 世界! ".repeat(200);
+        let chunks = split_by_chars(&content, 100, 0, None, 20);
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(!chunk.content.is_empty());
+        }
     }
 
     #[test]

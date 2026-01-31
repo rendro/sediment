@@ -51,7 +51,9 @@ impl RetryConfig {
 
     /// Calculate the delay for a given attempt number (0-indexed)
     fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let delay_ms = self.initial_delay_ms * 2u64.pow(attempt);
+        let delay_ms = self
+            .initial_delay_ms
+            .saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX));
         let capped_delay_ms = delay_ms.min(self.max_delay_ms);
         Duration::from_millis(capped_delay_ms)
     }
@@ -180,6 +182,18 @@ mod tests {
 
         assert_eq!(result, Err("persistent error"));
         assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_delay_for_attempt_no_overflow() {
+        // Bug #10: large attempt numbers should not panic due to overflow
+        let config = RetryConfig::new(100, 100, 2000);
+        // These should not panic
+        let d64 = config.delay_for_attempt(64);
+        let d100 = config.delay_for_attempt(99);
+        // Should be capped at max_delay_ms
+        assert_eq!(d64, Duration::from_millis(2000));
+        assert_eq!(d100, Duration::from_millis(2000));
     }
 
     #[test]

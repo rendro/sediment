@@ -251,6 +251,8 @@ pub struct RecallResult {
     pub results: Vec<crate::item::SearchResult>,
     pub graph_expanded: Vec<Value>,
     pub suggested: Vec<Value>,
+    /// Raw (pre-decay/trust) similarity scores, keyed by item ID
+    pub raw_similarities: std::collections::HashMap<String, f32>,
 }
 
 // ========== Tool Execution ==========
@@ -411,7 +413,7 @@ async fn execute_store(
     if let Some(obj) = metadata.as_object_mut() {
         let mut provenance = json!({
             "v": 1,
-            "project_path": ctx.cwd.to_string_lossy()
+            "project_path": ctx.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "unknown".to_string())
         });
         if let Some(ref rid) = replaced_id {
             provenance["supersedes"] = json!(rid);
@@ -479,16 +481,27 @@ async fn execute_store(
                     tracing::warn!("record_validation failed: {}", e);
                 }
                 // Transfer graph edges from old node to new node before removing old node
+                // If this fails, abort the replace to avoid inconsistent state
                 if let Err(e) = graph.transfer_edges(old_id, &new_id) {
-                    tracing::warn!("transfer_edges failed: {}", e);
+                    tracing::error!("transfer_edges failed, aborting replace: {}", e);
+                    // Compensating action: remove the new item since replace failed
+                    let _ = db.delete_item(&new_id).await;
+                    let _ = graph.remove_node(&new_id);
+                    return CallToolResult::error(format!(
+                        "Replace failed during edge transfer: {}. Original item preserved.",
+                        e
+                    ));
                 }
-                // Create SUPERSEDES edge before removing old node
+                // Create SUPERSEDES edge (non-critical, continue on failure)
                 if let Err(e) = graph.add_supersedes_edge(&new_id, old_id) {
                     tracing::warn!("add_supersedes_edge failed: {}", e);
                 }
                 // Delete old item from LanceDB
                 if let Err(e) = db.delete_item(old_id).await {
-                    tracing::warn!("delete_item failed: {}", e);
+                    tracing::error!(
+                        "delete_item failed during replace: {}. Old item may remain as duplicate.",
+                        e
+                    );
                 }
                 // Remove old graph node (and its remaining edges)
                 if let Err(e) = graph.remove_node(old_id) {
@@ -496,9 +509,20 @@ async fn execute_store(
                 }
             }
 
-            // Create RELATED edges if specified
+            // Create RELATED edges if specified (only for IDs that exist in LanceDB)
             if let Some(ref related_ids) = params.related {
+                let rid_refs: Vec<&str> = related_ids.iter().map(|s| s.as_str()).collect();
+                let existing_items = db.get_items_batch(&rid_refs).await.unwrap_or_default();
+                let valid_ids: std::collections::HashSet<&str> =
+                    existing_items.iter().map(|i| i.id.as_str()).collect();
+
                 for rid in related_ids {
+                    if !valid_ids.contains(rid.as_str()) {
+                        tracing::warn!("related ID not found, skipping edge: {}", rid);
+                        continue;
+                    }
+                    // Ensure target node exists in graph before creating edge
+                    let _ = graph.ensure_node_exists(rid, None, now);
                     if let Err(e) = graph.add_related_edge(&new_id, rid, 1.0, "user_linked") {
                         tracing::warn!("add_related_edge failed: {}", e);
                     }
@@ -538,7 +562,10 @@ async fn execute_store(
                 result["potential_conflicts"] = json!(conflicts);
             }
 
-            CallToolResult::success(serde_json::to_string_pretty(&result).unwrap())
+            CallToolResult::success(
+                serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e)),
+            )
         }
         Err(e) => CallToolResult::error(format!("Failed to store: {}", e)),
     }
@@ -567,6 +594,7 @@ pub async fn recall_pipeline(
             results: Vec::new(),
             graph_expanded: Vec::new(),
             suggested: Vec::new(),
+            raw_similarities: std::collections::HashMap::new(),
         });
     }
 
@@ -583,13 +611,17 @@ pub async fn recall_pipeline(
         }
     }
 
-    // Decay scoring
+    // Decay scoring — preserve raw similarity for transparency
+    let mut raw_similarities: std::collections::HashMap<String, f32> =
+        std::collections::HashMap::new();
     if config.enable_decay_scoring {
         let item_ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         let access_records = tracker.get_accesses(&item_ids).unwrap_or_default();
         let now = chrono::Utc::now().timestamp();
 
         for result in &mut results {
+            raw_similarities.insert(result.id.clone(), result.similarity);
+
             let created_at = result.created_at.timestamp();
             let (access_count, last_accessed) = match access_records.get(&result.id) {
                 Some(rec) => (rec.access_count, Some(rec.last_accessed_at)),
@@ -696,6 +728,7 @@ pub async fn recall_pipeline(
         results,
         graph_expanded,
         suggested,
+        raw_similarities,
     })
 }
 
@@ -713,6 +746,16 @@ async fn execute_recall(
         },
         None => return CallToolResult::error("Missing parameters"),
     };
+
+    // Reject oversized queries to prevent OOM during tokenization
+    const MAX_QUERY_BYTES: usize = 100_000;
+    if params.query.len() > MAX_QUERY_BYTES {
+        return CallToolResult::error(format!(
+            "Query too large: {} bytes (max {} bytes)",
+            params.query.len(),
+            MAX_QUERY_BYTES
+        ));
+    }
 
     let limit = params.limit.unwrap_or(5).min(100);
     let min_similarity = params.min_similarity.unwrap_or(0.3);
@@ -746,6 +789,13 @@ async fn execute_recall(
                 "similarity": format!("{:.2}", r.similarity),
                 "created": r.created_at.to_rfc3339(),
             });
+
+            // Include raw (pre-decay) similarity when decay scoring was applied
+            if let Some(&raw_sim) = recall_result.raw_similarities.get(&r.id)
+                && (raw_sim - r.similarity).abs() > 0.001
+            {
+                obj["raw_similarity"] = json!(format!("{:.2}", raw_sim));
+            }
 
             if let Some(ref excerpt) = r.relevant_excerpt {
                 obj["relevant_excerpt"] = json!(excerpt);
@@ -821,7 +871,7 @@ async fn execute_recall(
     // Periodic maintenance: every 10th recall
     let run_count = ctx
         .recall_count
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     if run_count % 10 == 9 {
         // Clustering
         let access_db_path = ctx.access_db_path.clone();
@@ -873,7 +923,10 @@ async fn execute_recall(
         });
     }
 
-    CallToolResult::success(serde_json::to_string_pretty(&result_json).unwrap())
+    CallToolResult::success(
+        serde_json::to_string_pretty(&result_json)
+            .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e)),
+    )
 }
 
 async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult {
@@ -938,7 +991,11 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
                     "items": formatted
                 });
 
-                CallToolResult::success(serde_json::to_string_pretty(&result).unwrap())
+                CallToolResult::success(
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
+                        format!("{{\"error\": \"serialization failed: {}\"}}", e)
+                    }),
+                )
             }
         }
         Err(e) => CallToolResult::error(format!("Failed to list items: {}", e)),
@@ -969,7 +1026,10 @@ async fn execute_forget(
                 "success": true,
                 "message": format!("Deleted item: {}", params.id)
             });
-            CallToolResult::success(serde_json::to_string_pretty(&result).unwrap())
+            CallToolResult::success(
+                serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e)),
+            )
         }
         Ok(false) => CallToolResult::error(format!("Item not found: {}", params.id)),
         Err(e) => CallToolResult::error(format!("Failed to delete: {}", e)),
@@ -1030,7 +1090,10 @@ async fn execute_connections(
                 "connections": conn_json
             });
 
-            CallToolResult::success(serde_json::to_string_pretty(&result).unwrap())
+            CallToolResult::success(
+                serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e)),
+            )
         }
         Err(e) => CallToolResult::error(format!("Failed to get connections: {}", e)),
     }

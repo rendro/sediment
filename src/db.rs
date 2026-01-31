@@ -761,12 +761,13 @@ impl Database {
         };
 
         // Read the item first so we have a full copy for recovery
-        let item = self.get_item(id).await?;
-        let mut item = match item {
+        let original_item = self.get_item(id).await?;
+        let original_item = match original_item {
             Some(i) => i,
             None => return Err(SedimentError::Database(format!("Item not found: {}", id))),
         };
 
+        let mut item = original_item.clone();
         item.expires_at = Some(expires_at);
 
         // Delete first, then re-insert with updated expires_at.
@@ -795,6 +796,18 @@ impl Database {
                         .await;
                 }
             }
+        }
+
+        // Emergency recovery: re-insert the original item to prevent data loss
+        tracing::error!("expire_item: re-insert failed after 3 attempts, attempting recovery");
+        let batch = item_to_batch(&original_item)?;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], Arc::new(item_schema()));
+        if let Err(recovery_err) = table.add(Box::new(batches)).execute().await {
+            tracing::error!(
+                "expire_item: CRITICAL - recovery also failed, item {} may be lost: {}",
+                id,
+                recovery_err
+            );
         }
 
         Err(SedimentError::Database(format!(
@@ -921,7 +934,10 @@ impl Database {
         let mut ids = Vec::new();
         for batch in &batches {
             if let Some(id_col) = batch.column_by_name("id") {
-                let id_array = id_col.as_any().downcast_ref::<StringArray>().unwrap();
+                let id_array = match id_col.as_any().downcast_ref::<StringArray>() {
+                    Some(arr) => arr,
+                    None => continue, // Skip batch if column type is unexpected
+                };
                 for i in 0..id_array.len() {
                     if !id_array.is_null(i) {
                         ids.push(id_array.value(i).to_string());

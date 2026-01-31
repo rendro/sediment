@@ -105,10 +105,14 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
         }
     }
 
-    // Graceful shutdown: give background tasks time to complete
+    // Graceful shutdown: wait for in-flight consolidation before dropping
     tracing::info!("Client disconnected, shutting down...");
+    let sem = ctx.consolidation_semaphore.clone();
+    let _ = rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), sem.acquire()).await
+    });
     drop(ctx);
-    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
 
     Ok(())
 }
