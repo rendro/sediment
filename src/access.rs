@@ -45,9 +45,14 @@ impl AccessTracker {
         })?;
 
         // Idempotent schema migration: add validation_count column
-        let _ = conn.execute_batch(
+        if let Err(e) = conn.execute_batch(
             "ALTER TABLE access_log ADD COLUMN validation_count INTEGER NOT NULL DEFAULT 0;",
-        );
+        ) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                tracing::warn!("access_log migration unexpected error: {}", msg);
+            }
+        }
 
         Ok(Self { conn })
     }

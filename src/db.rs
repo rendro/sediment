@@ -377,6 +377,9 @@ impl Database {
         limit: usize,
         filters: ItemFilters,
     ) -> Result<Vec<SearchResult>> {
+        // Retry vector index creation if it failed previously
+        self.ensure_vector_index().await?;
+
         // Generate query embedding
         let query_embedding = self.embedder.embed(query)?;
         let min_similarity = filters.min_similarity.unwrap_or(0.3);
@@ -756,9 +759,6 @@ impl Database {
             None => return Err(SedimentError::Database(format!("Item not found: {}", id))),
         };
 
-        // Re-generate embedding since get_item returns empty embeddings
-        let embedding_text = item.embedding_text();
-        item.embedding = self.embedder.embed(&embedding_text)?;
         item.expires_at = Some(expires_at);
 
         // Insert-before-delete to avoid data loss on crash
@@ -1014,6 +1014,10 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
         .column_by_name("created_at")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
+    let vector_col = batch
+        .column_by_name("vector")
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
+
     for i in 0..batch.num_rows() {
         let id = id_col.value(i).to_string();
         let content = content_col.value(i).to_string();
@@ -1082,10 +1086,20 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
             })
             .unwrap_or_else(Utc::now);
 
+        let embedding = vector_col
+            .and_then(|col| {
+                let value = col.value(i);
+                value
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .map(|arr| arr.values().to_vec())
+            })
+            .unwrap_or_default();
+
         let item = Item {
             id,
             content,
-            embedding: Vec::new(),
+            embedding,
             title,
             tags,
             source,

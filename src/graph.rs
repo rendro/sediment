@@ -337,7 +337,13 @@ impl GraphStore {
             .map_err(|e| {
                 SedimentError::Database(format!("Failed to query edges for transfer: {}", e))
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("transfer_edges: failed to read row: {}", e);
+                    None
+                }
+            })
             .collect();
 
         // Create edges on the new node
@@ -353,14 +359,22 @@ impl GraphStore {
     /// Detect triangles of RELATED items (for clustering).
     /// Returns sets of 3 item IDs that form triangles.
     pub fn detect_clusters(&self) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT e1.from_id, e1.to_id, e2.to_id
-             FROM graph_edges e1
-             JOIN graph_edges e2 ON e1.to_id = e2.from_id AND e1.edge_type = 'related' AND e2.edge_type = 'related'
-             JOIN graph_edges e3 ON e2.to_id = e3.to_id AND e3.from_id = e1.from_id AND e3.edge_type = 'related'
-             WHERE e1.from_id < e1.to_id AND e1.to_id < e2.to_id
-             LIMIT 50"
-        ).map_err(|e| SedimentError::Database(format!("Failed to detect clusters: {}", e)))?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "WITH biedges AS (
+                SELECT from_id AS a, to_id AS b FROM graph_edges WHERE edge_type = 'related'
+                UNION ALL
+                SELECT to_id AS a, from_id AS b FROM graph_edges WHERE edge_type = 'related'
+            )
+            SELECT DISTINCT e1.a, e1.b, e2.b
+            FROM biedges e1
+            JOIN biedges e2 ON e1.b = e2.a
+            JOIN biedges e3 ON e2.b = e3.a AND e3.b = e1.a
+            WHERE e1.a < e1.b AND e1.b < e2.b
+            LIMIT 50",
+            )
+            .map_err(|e| SedimentError::Database(format!("Failed to detect clusters: {}", e)))?;
 
         let rows = stmt
             .query_map([], |row| {

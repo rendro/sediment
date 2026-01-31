@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const JSONRPC_VERSION: &str = "2.0";
-pub const MCP_VERSION: &str = "2024-11-05";
+pub const MCP_VERSION: &str = "2025-03-26";
 
 /// JSON-RPC request
 #[derive(Debug, Deserialize)]

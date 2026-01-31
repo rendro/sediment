@@ -70,30 +70,38 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
         rate_limit_count: AtomicU64::new(0),
     };
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let reader = stdin.lock();
+    // Run the request loop in a block so borrows of `rt` end before shutdown
+    {
+        let stdin = io::stdin();
+        let mut stdout = io::stdout();
+        let reader = stdin.lock();
 
-    tracing::info!("MCP server ready, waiting for requests...");
+        tracing::info!("MCP server ready, waiting for requests...");
 
-    for line in reader.lines() {
-        let line = line.context("Failed to read line")?;
+        for line in reader.lines() {
+            let line = line.context("Failed to read line")?;
 
-        if line.trim().is_empty() {
-            continue;
-        }
+            if line.trim().is_empty() {
+                continue;
+            }
 
-        tracing::debug!("Received: {}", line);
+            tracing::debug!("Received: {}", line);
 
-        // Handle request and get optional response (notifications don't get responses)
-        if let Some(response) = handle_request(&rt, &ctx, &line) {
-            let response_json = serde_json::to_string(&response)?;
-            tracing::debug!("Sending: {}", response_json);
+            // Handle request and get optional response (notifications don't get responses)
+            if let Some(response) = handle_request(&rt, &ctx, &line) {
+                let response_json = serde_json::to_string(&response)?;
+                tracing::debug!("Sending: {}", response_json);
 
-            writeln!(stdout, "{}", response_json)?;
-            stdout.flush()?;
+                writeln!(stdout, "{}", response_json)?;
+                stdout.flush()?;
+            }
         }
     }
+
+    // Graceful shutdown: give background tasks time to complete
+    tracing::info!("Client disconnected, shutting down...");
+    drop(ctx);
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
 
     Ok(())
 }
@@ -206,15 +214,18 @@ fn handle_call_tool(
             .unwrap_or_default()
             .as_millis() as u64;
         let window = ctx.rate_limit_window.load(Ordering::SeqCst);
-        if now_ms - window > 60_000 {
-            // Reset window (use compare_exchange to avoid racing with another reset)
-            if ctx
-                .rate_limit_window
+        let in_current_window = if now_ms - window > 60_000 {
+            // Try to reset window; if CAS fails, another call already reset it
+            ctx.rate_limit_window
                 .compare_exchange(window, now_ms, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                ctx.rate_limit_count.store(1, Ordering::SeqCst);
-            }
+                .is_err()
+        } else {
+            true
+        };
+
+        if !in_current_window {
+            // We successfully started a new window; this is call #1
+            ctx.rate_limit_count.store(1, Ordering::SeqCst);
         } else {
             let count = ctx.rate_limit_count.fetch_add(1, Ordering::SeqCst) + 1;
             if count > MAX_CALLS_PER_MINUTE {

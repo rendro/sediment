@@ -107,8 +107,8 @@ The 5-tool API is defined in `src/mcp/tools.rs`:
 -- Graph nodes
 CREATE TABLE graph_nodes (
     id TEXT PRIMARY KEY,
-    project_id TEXT,
-    created_at INTEGER
+    project_id TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
 );
 
 -- Graph edges (RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING)
