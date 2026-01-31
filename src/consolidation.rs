@@ -32,8 +32,9 @@ impl ConsolidationQueue {
             SedimentError::Database(format!("Failed to open consolidation database: {}", e))
         })?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-            .ok();
+        if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;") {
+            tracing::warn!("Failed to set SQLite PRAGMAs (consolidation): {}", e);
+        }
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS consolidation_queue (
@@ -110,13 +111,18 @@ impl ConsolidationQueue {
         Ok(candidates)
     }
 
-    /// Delete processed (non-pending) entries older than 7 days to prevent unbounded growth.
+    /// Delete old entries to prevent unbounded growth:
+    /// - Processed (non-pending) entries older than 7 days
+    /// - Pending entries older than 30 days (likely stuck or referencing deleted items)
     pub fn cleanup_processed(&self) -> Result<()> {
-        let cutoff = chrono::Utc::now().timestamp() - 7 * 86400;
+        let processed_cutoff = chrono::Utc::now().timestamp() - 7 * 86400;
+        let pending_cutoff = chrono::Utc::now().timestamp() - 30 * 86400;
         self.conn
             .execute(
-                "DELETE FROM consolidation_queue WHERE status != 'pending' AND created_at < ?1",
-                params![cutoff],
+                "DELETE FROM consolidation_queue WHERE
+                    (status != 'pending' AND created_at < ?1) OR
+                    (status = 'pending' AND created_at < ?2)",
+                params![processed_cutoff, pending_cutoff],
             )
             .map_err(|e| {
                 SedimentError::Database(format!("Failed to cleanup consolidation queue: {}", e))
@@ -227,7 +233,28 @@ async fn process_candidate(
     candidate: &ConsolidationCandidate,
 ) -> Result<String> {
     let graph = crate::graph::GraphStore::open(graph_db_path)?;
-    if candidate.similarity >= 0.95 {
+
+    // Recompute similarity using current embeddings (the stored score may be stale
+    // if items were modified via replace since enqueue time).
+    let fresh_similarity = {
+        let item_a = db.get_item(&candidate.item_id_a).await?;
+        let item_b = db.get_item(&candidate.item_id_b).await?;
+        match (item_a.as_ref(), item_b.as_ref()) {
+            (Some(a), Some(b)) if !a.embedding.is_empty() && !b.embedding.is_empty() => {
+                // Cosine similarity (embeddings are L2-normalized, so dot product = cosine sim)
+                let dot: f32 = a
+                    .embedding
+                    .iter()
+                    .zip(b.embedding.iter())
+                    .map(|(x, y)| x * y)
+                    .sum();
+                dot as f64
+            }
+            _ => candidate.similarity, // fallback to stored score if items missing/no embeddings
+        }
+    };
+
+    if fresh_similarity >= 0.95 {
         // Near-duplicate: newer absorbs older (non-destructive — archive removed content)
         let item_a = db.get_item(&candidate.item_id_a).await?;
         let item_b = db.get_item(&candidate.item_id_b).await?;
@@ -268,7 +295,7 @@ async fn process_candidate(
                 if let Err(e) = graph.add_related_edge(
                     &keep.id,
                     &remove.id,
-                    candidate.similarity,
+                    fresh_similarity,
                     &format!("merged_archive:{}", archive_preview),
                 ) {
                     tracing::warn!("add_related_edge failed: {}", e);
@@ -303,11 +330,56 @@ async fn process_candidate(
         if let Err(e) = graph.add_related_edge(
             &candidate.item_id_a,
             &candidate.item_id_b,
-            candidate.similarity,
+            fresh_similarity,
             "similar",
         ) {
             tracing::warn!("add_related_edge failed: {}", e);
         }
         Ok("linked".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_cleanup_removes_old_pending_entries() {
+        // Fix #4: Pending entries older than 30 days should be cleaned up
+        let tmp = NamedTempFile::new().unwrap();
+        let queue = ConsolidationQueue::open(tmp.path()).unwrap();
+
+        // Insert a pending entry with a timestamp 31 days ago
+        let old_ts = chrono::Utc::now().timestamp() - 31 * 86400;
+        queue
+            .conn
+            .execute(
+                "INSERT INTO consolidation_queue (item_id_a, item_id_b, similarity, status, created_at)
+                 VALUES ('a', 'b', 0.9, 'pending', ?1)",
+                params![old_ts],
+            )
+            .unwrap();
+
+        // Insert a recent pending entry
+        queue.enqueue("c", "d", 0.9).unwrap();
+
+        queue.cleanup_processed().unwrap();
+
+        // Old pending entry should be removed, recent one should remain
+        let remaining = queue.fetch_pending(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].item_id_a, "c");
+    }
+
+    #[test]
+    fn test_enqueue_normalizes_order() {
+        let tmp = NamedTempFile::new().unwrap();
+        let queue = ConsolidationQueue::open(tmp.path()).unwrap();
+
+        queue.enqueue("z", "a", 0.9).unwrap();
+        let pending = queue.fetch_pending(10).unwrap();
+        assert_eq!(pending[0].item_id_a, "a");
+        assert_eq!(pending[0].item_id_b, "z");
     }
 }

@@ -74,11 +74,11 @@ impl std::fmt::Display for StoreScope {
 #[serde(rename_all = "lowercase")]
 pub enum ListScope {
     /// List only project-local items
+    #[default]
     Project,
     /// List only global items
     Global,
     /// List all items
-    #[default]
     All,
 }
 
@@ -148,7 +148,8 @@ impl Default for ProjectConfig {
 /// The project ID is stored in `<project_root>/.sediment/config`.
 /// If no config exists, a new UUID is generated and saved.
 pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> {
-    let config_path = project_root.join(".sediment").join("config");
+    let sediment_dir = project_root.join(".sediment");
+    let config_path = sediment_dir.join("config");
 
     // Try to read existing config
     if config_path.exists() {
@@ -162,15 +163,31 @@ pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> 
     let config = ProjectConfig::default();
 
     // Ensure .sediment directory exists
-    let sediment_dir = project_root.join(".sediment");
     std::fs::create_dir_all(&sediment_dir)?;
 
-    // Save config
+    // Write to a temp file first, then atomically rename to prevent TOCTOU races
+    // where two concurrent processes both see the file as missing and write different UUIDs.
     let content =
         serde_json::to_string_pretty(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(&config_path, &content)?;
+    let tmp_path = sediment_dir.join(format!("config.tmp.{}", std::process::id()));
+    std::fs::write(&tmp_path, &content)?;
 
-    Ok(config.project_id)
+    // Atomic rename: on Unix this is atomic. The first writer wins; subsequent renames
+    // just overwrite with a different UUID but that's acceptable since no data existed yet.
+    // After rename, re-read to get whichever UUID actually persisted.
+    if let Err(e) = std::fs::rename(&tmp_path, &config_path) {
+        // Clean up temp file on failure
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // Re-read to return the UUID that actually persisted (could be from another process)
+    let final_content = std::fs::read_to_string(&config_path)?;
+    if let Ok(final_config) = serde_json::from_str::<ProjectConfig>(&final_content) {
+        Ok(final_config.project_id)
+    } else {
+        Ok(config.project_id)
+    }
 }
 
 /// Apply similarity boosting based on project context.
@@ -239,4 +256,36 @@ pub fn init_project(project_root: &Path) -> std::io::Result<PathBuf> {
     get_or_create_project_id(project_root)?;
 
     Ok(sediment_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_list_scope_default_is_project() {
+        // Fix #17: ListScope::default() should be Project, matching the tool schema default
+        assert_eq!(ListScope::default(), ListScope::Project);
+    }
+
+    #[test]
+    fn test_store_scope_default_is_project() {
+        assert_eq!(StoreScope::default(), StoreScope::Project);
+    }
+
+    #[test]
+    fn test_project_config_idempotent() {
+        // Fix #18: get_or_create_project_id should return the same ID on repeated calls
+        let tmp = tempfile::TempDir::new().unwrap();
+        let id1 = get_or_create_project_id(tmp.path()).unwrap();
+        let id2 = get_or_create_project_id(tmp.path()).unwrap();
+        assert_eq!(id1, id2, "Repeated calls should return the same project ID");
+    }
+
+    #[test]
+    fn test_boost_similarity() {
+        assert!((boost_similarity(0.5, Some("p1"), Some("p1")) - 0.575).abs() < 0.001);
+        assert!((boost_similarity(0.5, Some("p1"), Some("p2")) - 0.475).abs() < 0.001);
+        assert!((boost_similarity(0.5, None, Some("p1")) - 0.5).abs() < 0.001);
+    }
 }

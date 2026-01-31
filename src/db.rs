@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Sanitize a string value for use in LanceDB SQL filter expressions
-/// by escaping single quotes to prevent injection attacks.
+/// by escaping backslashes and single quotes to prevent injection attacks.
 fn sanitize_sql_string(s: &str) -> String {
-    s.replace('\'', "''")
+    s.replace('\\', "\\\\").replace('\'', "''")
 }
 
 use arrow_array::{
@@ -377,6 +377,8 @@ impl Database {
         limit: usize,
         filters: ItemFilters,
     ) -> Result<Vec<SearchResult>> {
+        // Cap limit to prevent overflow in limit*2 and limit*3 multiplications below
+        let limit = limit.min(1000);
         // Retry vector index creation if it failed previously
         self.ensure_vector_index().await?;
 
@@ -748,14 +750,16 @@ impl Database {
 
     /// Soft-delete an item by setting its expiration to a past timestamp.
     /// The item remains in the database but is excluded from search results.
+    ///
+    /// Uses delete-then-insert because both rows share the same ID. If the
+    /// re-insert fails, retries up to 3 times to avoid data loss.
     pub async fn expire_item(&self, id: &str, expires_at: chrono::DateTime<Utc>) -> Result<()> {
         let table = match &self.items_table {
             Some(t) => t,
             None => return Err(SedimentError::Database("Items table not found".to_string())),
         };
 
-        // LanceDB doesn't support in-place updates easily, so we use a merge-insert
-        // approach: read the item, delete it, re-insert with updated expires_at.
+        // Read the item first so we have a full copy for recovery
         let item = self.get_item(id).await?;
         let mut item = match item {
             Some(i) => i,
@@ -772,15 +776,30 @@ impl Database {
             .await
             .map_err(|e| SedimentError::Database(format!("Delete for expire failed: {}", e)))?;
 
-        let batch = item_to_batch(&item)?;
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], Arc::new(item_schema()));
-        table
-            .add(Box::new(batches))
-            .execute()
-            .await
-            .map_err(|e| SedimentError::Database(format!("Re-insert for expire failed: {}", e)))?;
+        // Re-insert with retries to prevent data loss if insert fails after delete
+        let mut last_err = None;
+        for attempt in 0..3 {
+            let batch = item_to_batch(&item)?;
+            let batches = RecordBatchIterator::new(vec![Ok(batch)], Arc::new(item_schema()));
+            match table.add(Box::new(batches)).execute().await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        "Re-insert for expire failed (attempt {}/3): {}",
+                        attempt + 1,
+                        e
+                    );
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt)))
+                        .await;
+                }
+            }
+        }
 
-        Ok(())
+        Err(SedimentError::Database(format!(
+            "Re-insert for expire failed after 3 attempts: {}",
+            last_err.unwrap()
+        )))
     }
 
     /// Delete an item and its chunks.
@@ -850,15 +869,67 @@ impl Database {
         let count = table.count_rows(Some(filter.clone())).await.unwrap_or(0);
 
         if count > 0 {
+            // First, find the IDs of expired items so we can clean up their chunks
+            if let Ok(expired_ids) = self.get_expired_item_ids(now).await
+                && let Some(ref chunks_table) = self.chunks_table
+            {
+                for item_id in &expired_ids {
+                    let chunk_filter = format!("item_id = '{}'", sanitize_sql_string(item_id));
+                    if let Err(e) = chunks_table.delete(&chunk_filter).await {
+                        tracing::warn!(
+                            "Failed to delete chunks for expired item {}: {}",
+                            item_id,
+                            e
+                        );
+                    }
+                }
+            }
+
             table
                 .delete(&filter)
                 .await
                 .map_err(|e| SedimentError::Database(format!("Expired cleanup failed: {}", e)))?;
 
-            info!("Cleaned up {} expired items", count);
+            info!("Cleaned up {} expired items and their chunks", count);
         }
 
         Ok(count)
+    }
+
+    /// Get IDs of items that have expired (helper for cleanup)
+    async fn get_expired_item_ids(&self, now_ts: i64) -> Result<Vec<String>> {
+        let table = match &self.items_table {
+            Some(t) => t,
+            None => return Ok(vec![]),
+        };
+
+        let filter = format!("expires_at IS NOT NULL AND expires_at < {}", now_ts);
+        let results = table
+            .query()
+            .only_if(filter)
+            .select(lancedb::query::Select::Columns(vec!["id".to_string()]))
+            .execute()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Query expired IDs failed: {}", e)))?;
+
+        let batches = results
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Collect expired IDs failed: {}", e)))?;
+
+        let mut ids = Vec::new();
+        for batch in &batches {
+            if let Some(id_col) = batch.column_by_name("id") {
+                let id_array = id_col.as_any().downcast_ref::<StringArray>().unwrap();
+                for i in 0..id_array.len() {
+                    if !id_array.is_null(i) {
+                        ids.push(id_array.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(ids)
     }
 }
 
@@ -910,14 +981,30 @@ fn detect_content_type(content: &str) -> ContentType {
     }
 
     // Check for YAML (common patterns)
-    if trimmed.contains(":\n") || trimmed.starts_with("---") {
-        // Simple heuristic: looks like YAML if it has key: value patterns
-        let lines: Vec<&str> = trimmed.lines().take(5).collect();
-        let yaml_like = lines.iter().any(|line| {
-            let l = line.trim();
-            !l.is_empty() && !l.starts_with('#') && l.contains(':') && !l.starts_with("http")
-        });
-        if yaml_like {
+    // Require either a "---" document separator or multiple lines matching "key: value"
+    // where "key" is a simple identifier (no spaces before colon, no URLs).
+    if trimmed.contains(":\n") || trimmed.contains(": ") || trimmed.starts_with("---") {
+        let lines: Vec<&str> = trimmed.lines().take(10).collect();
+        let yaml_key_count = lines
+            .iter()
+            .filter(|line| {
+                let l = line.trim();
+                // A YAML key line: starts with a word-like key followed by ': '
+                // Excludes URLs (://), empty lines, comments, prose (key must be identifier-like)
+                !l.is_empty()
+                    && !l.starts_with('#')
+                    && !l.contains("://")
+                    && l.contains(": ")
+                    && l.split(": ").next().is_some_and(|key| {
+                        let k = key.trim_start_matches("- ");
+                        !k.is_empty()
+                            && k.chars()
+                                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                    })
+            })
+            .count();
+        // Require at least 2 YAML-like key lines or starts with ---
+        if yaml_key_count >= 2 || (trimmed.starts_with("---") && yaml_key_count >= 1) {
             return ContentType::Yaml;
         }
     }
@@ -1144,7 +1231,7 @@ fn chunk_to_batch(chunk: &Chunk) -> Result<RecordBatch> {
 
     let id = StringArray::from(vec![chunk.id.as_str()]);
     let item_id = StringArray::from(vec![chunk.item_id.as_str()]);
-    let chunk_index = Int32Array::from(vec![chunk.chunk_index as i32]);
+    let chunk_index = Int32Array::from(vec![i32::try_from(chunk.chunk_index).unwrap_or(i32::MAX)]);
     let content = StringArray::from(vec![chunk.content.as_str()]);
     let context = StringArray::from(vec![chunk.context.as_deref()]);
 
@@ -1271,5 +1358,38 @@ mod tests {
         // freshness = 1/(1+3) = 0.25
         let expected = 0.8 * 0.25;
         assert!((score - expected).abs() < 0.001, "got {}", score);
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_escapes_quotes_and_backslashes() {
+        // Fix #3: Backslashes should be escaped too
+        assert_eq!(sanitize_sql_string("hello"), "hello");
+        assert_eq!(sanitize_sql_string("it's"), "it''s");
+        assert_eq!(sanitize_sql_string(r"a\'b"), r"a\\''b");
+        assert_eq!(sanitize_sql_string(r"path\to\file"), r"path\\to\\file");
+    }
+
+    #[test]
+    fn test_detect_content_type_yaml_not_prose() {
+        // Fix #11: Prose with colons should NOT be detected as YAML
+        let prose = "Dear John:\nI wanted to write you about something.\nSubject: important matter";
+        let detected = detect_content_type(prose);
+        assert_ne!(
+            detected,
+            ContentType::Yaml,
+            "Prose with colons should not be detected as YAML"
+        );
+
+        // Actual YAML should still be detected
+        let yaml = "server: localhost\nport: 8080\ndatabase: mydb";
+        let detected = detect_content_type(yaml);
+        assert_eq!(detected, ContentType::Yaml);
+    }
+
+    #[test]
+    fn test_detect_content_type_yaml_with_separator() {
+        let yaml = "---\nname: test\nversion: 1.0";
+        let detected = detect_content_type(yaml);
+        assert_eq!(detected, ContentType::Yaml);
     }
 }

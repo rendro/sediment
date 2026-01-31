@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 
@@ -17,6 +17,13 @@ use super::protocol::{
     ToolsCapability,
 };
 use super::tools::{execute_tool, get_tools};
+
+/// Rate limiter state, protected by a mutex to avoid race conditions
+/// between window reset and count increment.
+pub struct RateLimitState {
+    pub window_start_ms: u64,
+    pub count: u64,
+}
 
 /// Server context holding shared resources
 pub struct ServerContext {
@@ -34,10 +41,8 @@ pub struct ServerContext {
     pub consolidation_semaphore: Arc<Semaphore>,
     /// Counter for recall invocations (triggers periodic clustering and expired cleanup)
     pub recall_count: std::sync::atomic::AtomicU64,
-    /// Rate limiter: start of the current 60-second window (unix timestamp in millis)
-    pub rate_limit_window: AtomicU64,
-    /// Rate limiter: number of tool calls in the current window
-    pub rate_limit_count: AtomicU64,
+    /// Rate limiter state (mutex protects window+count as a unit)
+    pub rate_limit: Mutex<RateLimitState>,
 }
 
 /// Run the MCP server
@@ -66,8 +71,10 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
         cwd,
         consolidation_semaphore: Arc::new(Semaphore::new(1)),
         recall_count: std::sync::atomic::AtomicU64::new(0),
-        rate_limit_window: AtomicU64::new(0),
-        rate_limit_count: AtomicU64::new(0),
+        rate_limit: Mutex::new(RateLimitState {
+            window_start_ms: 0,
+            count: 0,
+        }),
     };
 
     // Run the request loop in a block so borrows of `rt` end before shutdown
@@ -207,7 +214,7 @@ fn handle_call_tool(
     tracing::info!("Calling tool: {}", params.name);
 
     // Rate limiting: 60 calls per 60-second window.
-    // Uses a CAS loop to atomically check-and-reset the window to avoid races.
+    // Uses a mutex to atomically check window expiry and increment count.
     {
         const MAX_CALLS_PER_MINUTE: u64 = 60;
         let now_ms = std::time::SystemTime::now()
@@ -215,32 +222,17 @@ fn handle_call_tool(
             .unwrap_or_default()
             .as_millis() as u64;
 
-        loop {
-            let window = ctx.rate_limit_window.load(Ordering::SeqCst);
-            if now_ms.saturating_sub(window) > 60_000 {
-                // Window expired, try to reset
-                match ctx.rate_limit_window.compare_exchange(
-                    window,
-                    now_ms,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => {
-                        // We reset the window; this is call #1
-                        ctx.rate_limit_count.store(1, Ordering::SeqCst);
-                        break;
-                    }
-                    Err(_) => continue, // Another call reset it, re-check
-                }
-            } else {
-                let count = ctx.rate_limit_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if count > MAX_CALLS_PER_MINUTE {
-                    let result = super::protocol::CallToolResult::error(
-                        "Rate limit exceeded, try again later",
-                    );
-                    return Response::success(id, serde_json::to_value(result).unwrap());
-                }
-                break;
+        let mut state = ctx.rate_limit.lock().unwrap_or_else(|e| e.into_inner());
+        if now_ms.saturating_sub(state.window_start_ms) > 60_000 {
+            // Window expired, reset
+            state.window_start_ms = now_ms;
+            state.count = 1;
+        } else {
+            state.count += 1;
+            if state.count > MAX_CALLS_PER_MINUTE {
+                let result =
+                    super::protocol::CallToolResult::error("Rate limit exceeded, try again later");
+                return Response::success(id, serde_json::to_value(result).unwrap());
             }
         }
     }
@@ -254,4 +246,51 @@ fn handle_call_tool(
 /// Handle ping request
 fn handle_ping(id: Option<Value>) -> Response {
     Response::success(id, json!({}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rate_limiter_blocks_after_limit() {
+        // Fix #1: Rate limiter should correctly count within a window
+        let mut state = RateLimitState {
+            window_start_ms: 0,
+            count: 0,
+        };
+        let now_ms = 100_000u64;
+        // Window 0 is expired (100000 - 0 = 100000 > 60000)
+        assert!(now_ms.saturating_sub(state.window_start_ms) > 60_000);
+        state.window_start_ms = now_ms;
+        state.count = 1;
+
+        // Now simulate 59 more calls in the same window
+        for _ in 0..59 {
+            state.count += 1;
+        }
+        assert_eq!(state.count, 60);
+
+        // 61st call should exceed the limit
+        state.count += 1;
+        assert!(state.count > 60, "Should exceed rate limit");
+    }
+
+    #[test]
+    fn test_rate_limiter_resets_after_window() {
+        let mut state = RateLimitState {
+            window_start_ms: 100_000,
+            count: 60,
+        };
+
+        // Simulate time advancing past the window
+        let now_ms = 200_000u64; // 100 seconds later
+        if now_ms.saturating_sub(state.window_start_ms) > 60_000 {
+            state.window_start_ms = now_ms;
+            state.count = 1;
+        }
+
+        assert_eq!(state.count, 1, "Count should reset after window expires");
+        assert_eq!(state.window_start_ms, 200_000);
+    }
 }

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::Instrument;
 
 use crate::access::AccessTracker;
 use crate::consolidation::{ConsolidationQueue, spawn_consolidation};
@@ -19,6 +18,17 @@ use crate::{Database, ListScope, StoreScope};
 
 use super::protocol::{CallToolResult, Tool};
 use super::server::ServerContext;
+
+/// Spawn a background task with panic logging. If the task panics, the panic
+/// is caught and logged as an error instead of silently disappearing.
+fn spawn_logged(name: &'static str, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn(fut).await;
+        if let Err(e) = result {
+            tracing::error!("Background task '{}' panicked: {:?}", name, e);
+        }
+    });
+}
 
 /// Get all available tools (5 total)
 pub fn get_tools() -> Vec<Tool> {
@@ -463,16 +473,24 @@ async fn execute_store(
             // Complete replace: now that the new item is stored, delete the old one
             // (store-before-delete ensures no data loss on crash)
             if let Some(ref old_id) = replaced_id {
-                if let Err(e) = db.delete_item(old_id).await {
-                    tracing::warn!("delete_item failed: {}", e);
-                }
+                // Record validation on the NEW item (the replacement is a "confirmed" version)
                 let now_ts = chrono::Utc::now().timestamp();
-                if let Err(e) = tracker.record_validation(old_id, now_ts) {
+                if let Err(e) = tracker.record_validation(&new_id, now_ts) {
                     tracing::warn!("record_validation failed: {}", e);
                 }
+                // Transfer graph edges from old node to new node before removing old node
+                if let Err(e) = graph.transfer_edges(old_id, &new_id) {
+                    tracing::warn!("transfer_edges failed: {}", e);
+                }
+                // Create SUPERSEDES edge before removing old node
                 if let Err(e) = graph.add_supersedes_edge(&new_id, old_id) {
                     tracing::warn!("add_supersedes_edge failed: {}", e);
                 }
+                // Delete old item from LanceDB
+                if let Err(e) = db.delete_item(old_id).await {
+                    tracing::warn!("delete_item failed: {}", e);
+                }
+                // Remove old graph node (and its remaining edges)
                 if let Err(e) = graph.remove_node(old_id) {
                     tracing::warn!("remove_node failed: {}", e);
                 }
@@ -790,18 +808,15 @@ async fn execute_recall(
     // Fire-and-forget: co-access recording (Phase 3a)
     let result_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
     let access_db_path = ctx.access_db_path.clone();
-    tokio::spawn(
-        async move {
-            if let Ok(g) = GraphStore::open(&access_db_path) {
-                if let Err(e) = g.record_co_access(&result_ids) {
-                    tracing::warn!("record_co_access failed: {}", e);
-                }
-            } else {
-                tracing::warn!("co_access: failed to open graph store");
+    spawn_logged("co_access", async move {
+        if let Ok(g) = GraphStore::open(&access_db_path) {
+            if let Err(e) = g.record_co_access(&result_ids) {
+                tracing::warn!("record_co_access failed: {}", e);
             }
+        } else {
+            tracing::warn!("co_access: failed to open graph store");
         }
-        .instrument(tracing::info_span!("co_access")),
-    );
+    });
 
     // Periodic maintenance: every 10th recall
     let run_count = ctx
@@ -810,61 +825,52 @@ async fn execute_recall(
     if run_count % 10 == 9 {
         // Clustering
         let access_db_path = ctx.access_db_path.clone();
-        tokio::spawn(
-            async move {
-                if let Ok(g) = GraphStore::open(&access_db_path)
-                    && let Ok(clusters) = g.detect_clusters()
-                {
-                    for (a, b, c) in &clusters {
-                        let label = format!("cluster-{}", &a[..8.min(a.len())]);
-                        if let Err(e) = g.add_related_edge(a, b, 0.8, &label) {
-                            tracing::warn!("cluster add_related_edge failed: {}", e);
-                        }
-                        if let Err(e) = g.add_related_edge(b, c, 0.8, &label) {
-                            tracing::warn!("cluster add_related_edge failed: {}", e);
-                        }
-                        if let Err(e) = g.add_related_edge(a, c, 0.8, &label) {
-                            tracing::warn!("cluster add_related_edge failed: {}", e);
-                        }
+        spawn_logged("clustering", async move {
+            if let Ok(g) = GraphStore::open(&access_db_path)
+                && let Ok(clusters) = g.detect_clusters()
+            {
+                for (a, b, c) in &clusters {
+                    let label = format!("cluster-{}", &a[..8.min(a.len())]);
+                    if let Err(e) = g.add_related_edge(a, b, 0.8, &label) {
+                        tracing::warn!("cluster add_related_edge failed: {}", e);
                     }
-                    if !clusters.is_empty() {
-                        tracing::info!("Detected {} clusters", clusters.len());
+                    if let Err(e) = g.add_related_edge(b, c, 0.8, &label) {
+                        tracing::warn!("cluster add_related_edge failed: {}", e);
+                    }
+                    if let Err(e) = g.add_related_edge(a, c, 0.8, &label) {
+                        tracing::warn!("cluster add_related_edge failed: {}", e);
                     }
                 }
+                if !clusters.is_empty() {
+                    tracing::info!("Detected {} clusters", clusters.len());
+                }
             }
-            .instrument(tracing::info_span!("clustering")),
-        );
+        });
 
         // Expired item cleanup
         let db_path = ctx.db_path.clone();
         let project_id = ctx.project_id.clone();
         let embedder = ctx.embedder.clone();
-        tokio::spawn(
-            async move {
-                match Database::open_with_embedder(&db_path, project_id, embedder).await {
-                    Ok(db) => {
-                        if let Err(e) = db.cleanup_expired().await {
-                            tracing::warn!("cleanup_expired failed: {}", e);
-                        }
+        spawn_logged("cleanup_expired", async move {
+            match Database::open_with_embedder(&db_path, project_id, embedder).await {
+                Ok(db) => {
+                    if let Err(e) = db.cleanup_expired().await {
+                        tracing::warn!("cleanup_expired failed: {}", e);
                     }
-                    Err(e) => tracing::warn!("cleanup_expired: failed to open db: {}", e),
                 }
+                Err(e) => tracing::warn!("cleanup_expired: failed to open db: {}", e),
             }
-            .instrument(tracing::info_span!("cleanup_expired")),
-        );
+        });
 
         // Consolidation queue cleanup: purge old processed entries
         let access_db_path2 = ctx.access_db_path.clone();
-        tokio::spawn(
-            async move {
-                if let Ok(q) = crate::consolidation::ConsolidationQueue::open(&access_db_path2)
-                    && let Err(e) = q.cleanup_processed()
-                {
-                    tracing::warn!("consolidation queue cleanup failed: {}", e);
-                }
+        spawn_logged("consolidation_cleanup", async move {
+            if let Ok(q) = crate::consolidation::ConsolidationQueue::open(&access_db_path2)
+                && let Err(e) = q.cleanup_processed()
+            {
+                tracing::warn!("consolidation queue cleanup failed: {}", e);
             }
-            .instrument(tracing::info_span!("consolidation_cleanup")),
-        );
+        });
     }
 
     CallToolResult::success(serde_json::to_string_pretty(&result_json).unwrap())

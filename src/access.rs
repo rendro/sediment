@@ -30,8 +30,9 @@ impl AccessTracker {
             SedimentError::Database(format!("Failed to open access database: {}", e))
         })?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-            .ok();
+        if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;") {
+            tracing::warn!("Failed to set SQLite PRAGMAs (access): {}", e);
+        }
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS access_log (
@@ -195,5 +196,27 @@ mod tests {
         let tracker = AccessTracker::open(tmp.path()).unwrap();
         let records = tracker.get_accesses(&[]).unwrap();
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_record_validation_on_new_item() {
+        // Fix #5: validation should be recorded on the new (replacement) item
+        let tmp = NamedTempFile::new().unwrap();
+        let tracker = AccessTracker::open(tmp.path()).unwrap();
+
+        let created = 1700000000i64;
+        // Record validation on a new item (not pre-existing)
+        tracker.record_validation("new-item", created).unwrap();
+        tracker.record_validation("new-item", created).unwrap();
+
+        let count = tracker.get_validation_count("new-item").unwrap();
+        assert_eq!(
+            count, 2,
+            "Validation count should be 2 after two record_validation calls"
+        );
+
+        // Item that was never validated should have 0
+        let count = tracker.get_validation_count("other-item").unwrap();
+        assert_eq!(count, 0);
     }
 }

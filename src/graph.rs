@@ -47,8 +47,9 @@ impl GraphStore {
             SedimentError::Database(format!("Failed to open graph database: {}", e))
         })?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-            .ok();
+        if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;") {
+            tracing::warn!("Failed to set SQLite PRAGMAs (graph): {}", e);
+        }
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS graph_nodes (
@@ -213,11 +214,15 @@ impl GraphStore {
             })
             .map_err(|e| SedimentError::Database(format!("Failed to query neighbors: {}", e)))?;
 
+        // Filter out input IDs from results so we never return a query ID as its own neighbor
+        let input_set: std::collections::HashSet<&str> = ids.iter().copied().collect();
         let mut results = Vec::new();
         for row in rows {
             let r = row
                 .map_err(|e| SedimentError::Database(format!("Failed to read neighbor: {}", e)))?;
-            results.push(r);
+            if !input_set.contains(r.0.as_str()) {
+                results.push(r);
+            }
         }
 
         Ok(results)
@@ -240,8 +245,13 @@ impl GraphStore {
 
         for i in 0..item_ids.len() {
             for j in (i + 1)..item_ids.len() {
-                let a = &item_ids[i];
-                let b = &item_ids[j];
+                // Normalize edge direction: smaller ID always goes first to prevent
+                // duplicate edges (A,B) and (B,A) from accumulating separately.
+                let (a, b) = if item_ids[i] <= item_ids[j] {
+                    (&item_ids[i], &item_ids[j])
+                } else {
+                    (&item_ids[j], &item_ids[i])
+                };
 
                 self.conn
                     .execute(
@@ -468,5 +478,102 @@ impl GraphStore {
             .map_err(|e| SedimentError::Database(format!("Failed to count edges: {}", e)))?;
 
         Ok(count as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    fn open_test_graph() -> GraphStore {
+        let tmp = NamedTempFile::new().unwrap();
+        GraphStore::open(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn test_get_neighbors_excludes_input_ids() {
+        // Fix #7: get_neighbors should never return an input ID as a neighbor
+        let graph = open_test_graph();
+        let now = chrono::Utc::now().timestamp();
+        graph.add_node("A", Some("proj"), now).unwrap();
+        graph.add_node("B", Some("proj"), now).unwrap();
+        graph.add_node("C", Some("proj"), now).unwrap();
+
+        // Create edges A-B, B-C
+        graph.add_related_edge("A", "B", 0.9, "test").unwrap();
+        graph.add_related_edge("B", "C", 0.9, "test").unwrap();
+
+        // Query neighbors for [A, B] — should only return C, not A or B
+        let neighbors = graph.get_neighbors(&["A", "B"], 0.0).unwrap();
+        let neighbor_ids: Vec<&str> = neighbors.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert!(neighbor_ids.contains(&"C"));
+        assert!(!neighbor_ids.contains(&"A"));
+        assert!(!neighbor_ids.contains(&"B"));
+    }
+
+    #[test]
+    fn test_co_access_normalized_direction() {
+        // Fix #8: co-access edges should be normalized so (A,B) and (B,A) don't create duplicates
+        let graph = open_test_graph();
+        let now = chrono::Utc::now().timestamp();
+        graph.add_node("Z", Some("proj"), now).unwrap();
+        graph.add_node("A", Some("proj"), now).unwrap();
+
+        // Record co-access with Z before A (Z > A lexicographically)
+        graph
+            .record_co_access(&["Z".to_string(), "A".to_string()])
+            .unwrap();
+        // Record again with reversed order
+        graph
+            .record_co_access(&["A".to_string(), "Z".to_string()])
+            .unwrap();
+
+        // Should only have 1 edge with count=2 (not 2 edges with count=1 each)
+        let count: i64 = graph
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edges WHERE edge_type = 'co_accessed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "Should have exactly 1 co-access edge");
+
+        let edge_count: i64 = graph
+            .conn
+            .query_row(
+                "SELECT count FROM graph_edges WHERE edge_type = 'co_accessed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_count, 2, "Edge count should be 2 (incremented twice)");
+    }
+
+    #[test]
+    fn test_transfer_edges_preserves_relationships() {
+        // Fix #6: transfer_edges should move edges from old node to new node
+        let graph = open_test_graph();
+        let now = chrono::Utc::now().timestamp();
+        graph.add_node("old", Some("proj"), now).unwrap();
+        graph.add_node("new", Some("proj"), now).unwrap();
+        graph.add_node("friend", Some("proj"), now).unwrap();
+
+        graph
+            .add_related_edge("old", "friend", 0.9, "test")
+            .unwrap();
+
+        // Transfer edges from old to new
+        graph.transfer_edges("old", "new").unwrap();
+
+        // New node should now have edge to friend
+        let neighbors = graph.get_neighbors(&["new"], 0.0).unwrap();
+        assert!(
+            !neighbors.is_empty(),
+            "New node should have inherited edges"
+        );
+        let neighbor_ids: Vec<&str> = neighbors.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert!(neighbor_ids.contains(&"friend"));
     }
 }
