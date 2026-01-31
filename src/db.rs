@@ -790,6 +790,53 @@ impl Database {
         Ok(true)
     }
 
+    /// Delete items whose `expires_at` timestamp is in the past.
+    /// Returns the number of items purged.
+    pub async fn purge_expired_items(&self) -> Result<usize> {
+        let now = Utc::now().timestamp();
+        let mut purged = 0;
+
+        // Delete expired chunks
+        if let Some(chunks_table) = &self.chunks_table {
+            let filter = format!("expires_at IS NOT NULL AND expires_at <= {}", now);
+            chunks_table.delete(&filter).await.map_err(|e| {
+                SedimentError::Database(format!("Purge expired chunks failed: {}", e))
+            })?;
+        }
+
+        // Find and delete expired items
+        if let Some(table) = &self.items_table {
+            let filter = format!("expires_at IS NOT NULL AND expires_at <= {}", now);
+            let expired = table
+                .query()
+                .only_if(filter.clone())
+                .execute()
+                .await
+                .map_err(|e| SedimentError::Database(format!("Query expired items failed: {}", e)))?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| {
+                    SedimentError::Database(format!("Collect expired items failed: {}", e))
+                })?;
+
+            for batch in &expired {
+                purged += batch.num_rows();
+            }
+
+            if purged > 0 {
+                table
+                    .delete(&format!("expires_at IS NOT NULL AND expires_at <= {}", now))
+                    .await
+                    .map_err(|e| {
+                        SedimentError::Database(format!("Purge expired items failed: {}", e))
+                    })?;
+                tracing::info!("Purged {} expired items", purged);
+            }
+        }
+
+        Ok(purged)
+    }
+
     /// Get database statistics
     pub async fn stats(&self) -> Result<DatabaseStats> {
         let mut stats = DatabaseStats::default();

@@ -194,6 +194,9 @@ pub fn boost_similarity(
 ///
 /// Looks for directories containing `.sediment/` or `.git/` markers.
 /// Returns `None` if no project root is found.
+/// Maximum number of parent directories to traverse when searching for a project root.
+const MAX_TRAVERSAL_DEPTH: usize = 64;
+
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
 
@@ -202,7 +205,7 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
         current = current.parent()?.to_path_buf();
     }
 
-    loop {
+    for _ in 0..MAX_TRAVERSAL_DEPTH {
         // Check for .sediment directory first (explicit project marker)
         if current.join(".sediment").is_dir() {
             return Some(current);
@@ -215,10 +218,16 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
 
         // Move to parent directory
         match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => return None,
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return None,
         }
     }
+
+    tracing::warn!(
+        "Project root search exceeded maximum traversal depth from {:?}",
+        start
+    );
+    None
 }
 
 /// Initialize a project directory for Sediment.

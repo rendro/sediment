@@ -7,6 +7,8 @@ use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 use tracing::info;
 
+use sha2::{Digest, Sha256};
+
 use crate::error::{Result, SedimentError};
 
 /// Default model to use for embeddings
@@ -187,6 +189,72 @@ impl Embedder {
     }
 }
 
+/// Path to the hash manifest file stored alongside cached models.
+const HASH_MANIFEST_FILE: &str = ".sediment_hashes.json";
+
+/// Compute the SHA256 hash of a file.
+fn compute_file_hash(path: &PathBuf) -> Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        SedimentError::ModelLoading(format!("Failed to open file for verification: {}", e))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let bytes_read = file.read(&mut buffer).map_err(|e| {
+            SedimentError::ModelLoading(format!("Failed to read file for hashing: {}", e))
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Verify model file integrity using a trust-on-first-use (TOFU) approach.
+///
+/// On first download, computes and stores SHA256 hashes in a manifest file.
+/// On subsequent loads, verifies files match the stored hashes to detect
+/// tampering or corruption of cached model files.
+fn verify_file_integrity(path: &PathBuf, filename: &str) -> Result<()> {
+    let hash = compute_file_hash(path)?;
+
+    // Store/check hash in manifest next to the model cache
+    let manifest_path = path
+        .parent()
+        .map(|p| p.join(HASH_MANIFEST_FILE))
+        .ok_or_else(|| SedimentError::ModelLoading("Cannot determine model cache dir".into()))?;
+
+    let mut manifest: serde_json::Map<String, serde_json::Value> = if manifest_path.exists() {
+        let content = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+
+    if let Some(stored) = manifest.get(filename).and_then(|v| v.as_str()) {
+        if stored != hash {
+            return Err(SedimentError::ModelLoading(format!(
+                "Integrity check failed for {}: stored hash {}, current hash {}. \
+                 The cached model file may have been corrupted or tampered with. \
+                 Delete the cached model and retry.",
+                filename, stored, hash
+            )));
+        }
+        tracing::debug!("Integrity verified for {}", filename);
+    } else {
+        // First time: record the hash
+        manifest.insert(filename.to_string(), serde_json::Value::String(hash));
+        if let Ok(content) = serde_json::to_string_pretty(&manifest) {
+            let _ = std::fs::write(&manifest_path, content);
+        }
+        tracing::info!("Recorded integrity hash for {}", filename);
+    }
+
+    Ok(())
+}
+
 /// Download model files from Hugging Face Hub
 fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let api = ApiBuilder::from_env()
@@ -199,10 +267,12 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let model_path = repo
         .get("model.safetensors")
         .map_err(|e| SedimentError::ModelLoading(format!("Failed to download model: {}", e)))?;
+    verify_file_integrity(&model_path, "model.safetensors")?;
 
     let tokenizer_path = repo
         .get("tokenizer.json")
         .map_err(|e| SedimentError::ModelLoading(format!("Failed to download tokenizer: {}", e)))?;
+    verify_file_integrity(&tokenizer_path, "tokenizer.json")?;
 
     let config_path = repo
         .get("config.json")

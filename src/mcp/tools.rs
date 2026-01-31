@@ -772,10 +772,20 @@ async fn execute_recall(
         }
     });
 
-    // Periodic clustering (Phase 4b): every 10th consolidation run
+    // Periodic expired item cleanup: every 5th recall
     let run_count = ctx
         .consolidation_run_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if run_count % 5 == 4 {
+        let db_path = ctx.db_path.clone();
+        tokio::spawn(async move {
+            if let Ok(purge_db) = Database::open(&db_path).await {
+                let _ = purge_db.purge_expired_items().await;
+            }
+        });
+    }
+
+    // Periodic clustering (Phase 4b): every 10th consolidation run
     if run_count % 10 == 9 {
         let access_db_path = ctx.access_db_path.clone();
         tokio::spawn(async move {
