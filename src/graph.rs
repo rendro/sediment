@@ -47,7 +47,8 @@ impl GraphStore {
             SedimentError::Database(format!("Failed to open graph database: {}", e))
         })?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .ok();
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS graph_nodes (
@@ -161,6 +162,10 @@ impl GraphStore {
 
     /// Get 1-hop neighbors of the given item IDs via RELATED or SUPERSEDES edges.
     /// Returns (neighbor_id, rel_type, strength) tuples.
+    ///
+    /// Note on parameter binding: SQLite reuses the same positional parameters (?1..?N)
+    /// across all three IN clauses and the CASE expression. This is correct because
+    /// SQLite binds by position, so the same parameter set is applied to each reference.
     pub fn get_neighbors(
         &self,
         ids: &[&str],

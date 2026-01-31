@@ -32,8 +32,8 @@ pub struct ServerContext {
     pub cwd: PathBuf,
     /// Semaphore to ensure only one consolidation task runs at a time
     pub consolidation_semaphore: Arc<Semaphore>,
-    /// Counter for consolidation runs (for periodic clustering)
-    pub consolidation_run_count: std::sync::atomic::AtomicU64,
+    /// Counter for recall invocations (triggers periodic clustering and expired cleanup)
+    pub recall_count: std::sync::atomic::AtomicU64,
     /// Rate limiter: start of the current 60-second window (unix timestamp in millis)
     pub rate_limit_window: AtomicU64,
     /// Rate limiter: number of tool calls in the current window
@@ -65,7 +65,7 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
         embedder,
         cwd,
         consolidation_semaphore: Arc::new(Semaphore::new(1)),
-        consolidation_run_count: std::sync::atomic::AtomicU64::new(0),
+        recall_count: std::sync::atomic::AtomicU64::new(0),
         rate_limit_window: AtomicU64::new(0),
         rate_limit_count: AtomicU64::new(0),
     };
@@ -206,32 +206,41 @@ fn handle_call_tool(
 
     tracing::info!("Calling tool: {}", params.name);
 
-    // Rate limiting: 60 calls per 60-second window
+    // Rate limiting: 60 calls per 60-second window.
+    // Uses a CAS loop to atomically check-and-reset the window to avoid races.
     {
         const MAX_CALLS_PER_MINUTE: u64 = 60;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let window = ctx.rate_limit_window.load(Ordering::SeqCst);
-        let in_current_window = if now_ms - window > 60_000 {
-            // Try to reset window; if CAS fails, another call already reset it
-            ctx.rate_limit_window
-                .compare_exchange(window, now_ms, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        } else {
-            true
-        };
 
-        if !in_current_window {
-            // We successfully started a new window; this is call #1
-            ctx.rate_limit_count.store(1, Ordering::SeqCst);
-        } else {
-            let count = ctx.rate_limit_count.fetch_add(1, Ordering::SeqCst) + 1;
-            if count > MAX_CALLS_PER_MINUTE {
-                let result =
-                    super::protocol::CallToolResult::error("Rate limit exceeded, try again later");
-                return Response::success(id, serde_json::to_value(result).unwrap());
+        loop {
+            let window = ctx.rate_limit_window.load(Ordering::SeqCst);
+            if now_ms.saturating_sub(window) > 60_000 {
+                // Window expired, try to reset
+                match ctx.rate_limit_window.compare_exchange(
+                    window,
+                    now_ms,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => {
+                        // We reset the window; this is call #1
+                        ctx.rate_limit_count.store(1, Ordering::SeqCst);
+                        break;
+                    }
+                    Err(_) => continue, // Another call reset it, re-check
+                }
+            } else {
+                let count = ctx.rate_limit_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if count > MAX_CALLS_PER_MINUTE {
+                    let result = super::protocol::CallToolResult::error(
+                        "Rate limit exceeded, try again later",
+                    );
+                    return Response::success(id, serde_json::to_value(result).unwrap());
+                }
+                break;
             }
         }
     }

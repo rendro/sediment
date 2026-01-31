@@ -343,7 +343,12 @@ fn split_by_chars(
     chunks
 }
 
-/// Find a word boundary near the target position (byte-based for efficiency)
+/// Find a word boundary near the target position (byte-based for efficiency).
+///
+/// Safety: Only searches for ASCII bytes (space 0x20, newline 0x0A) which cannot
+/// appear as continuation bytes in multi-byte UTF-8 sequences. The returned
+/// position is always immediately after an ASCII byte, so slicing at this
+/// position is guaranteed to be on a valid UTF-8 char boundary.
 fn find_word_boundary_bytes(bytes: &[u8], start: usize, target: usize) -> usize {
     // Look backwards from target to find a space or newline
     let search_start = target.saturating_sub(50).max(start);
@@ -790,7 +795,11 @@ fn chunk_json(content: &str, config: &ChunkingConfig) -> Vec<ChunkResult> {
     chunk_text(content, config)
 }
 
-/// Recursively chunk a JSON value with path context
+/// Recursively chunk a JSON value with path context.
+///
+/// Note: JSON chunks are re-serialized from parsed JSON, so `start_offset` and
+/// `end_offset` represent positions within the serialized chunk content (0..len),
+/// not byte offsets into the original input string.
 fn chunk_json_value(
     value: &serde_json::Value,
     config: &ChunkingConfig,
@@ -820,13 +829,14 @@ fn chunk_json_value(
                     // Save current chunk if not empty
                     if current_chunk.len() > 3 {
                         current_chunk.push('}');
+                        let len = current_chunk.len();
                         let context = if path.is_empty() {
                             None
                         } else {
                             Some(path.join("."))
                         };
                         chunks.push(
-                            ChunkResult::new(current_chunk, 0, 0)
+                            ChunkResult::new(current_chunk, 0, len)
                                 .with_context(context)
                                 .with_boundary(true),
                         );
@@ -843,8 +853,9 @@ fn chunk_json_value(
                     && current_chunk.len() > 3
                 {
                     current_chunk.push('}');
+                    let len = current_chunk.len();
                     chunks.push(
-                        ChunkResult::new(current_chunk, 0, 0)
+                        ChunkResult::new(current_chunk, 0, len)
                             .with_context(Some(path_str.clone()))
                             .with_boundary(true),
                     );
@@ -856,13 +867,14 @@ fn chunk_json_value(
 
             current_chunk.push('}');
             if current_chunk.len() > 3 {
+                let len = current_chunk.len();
                 let context = if path.is_empty() {
                     None
                 } else {
                     Some(path.join("."))
                 };
                 chunks.push(
-                    ChunkResult::new(current_chunk, 0, 0)
+                    ChunkResult::new(current_chunk, 0, len)
                         .with_context(context)
                         .with_boundary(true),
                 );
@@ -887,8 +899,9 @@ fn chunk_json_value(
                     && current_chunk.len() > 3
                 {
                     current_chunk.push(']');
+                    let len = current_chunk.len();
                     chunks.push(
-                        ChunkResult::new(current_chunk, 0, 0)
+                        ChunkResult::new(current_chunk, 0, len)
                             .with_context(Some(path_str.clone()))
                             .with_boundary(true),
                     );
@@ -900,13 +913,14 @@ fn chunk_json_value(
 
             current_chunk.push(']');
             if current_chunk.len() > 3 {
+                let len = current_chunk.len();
                 let context = if path.is_empty() {
                     None
                 } else {
                     Some(path.join("."))
                 };
                 chunks.push(
-                    ChunkResult::new(current_chunk, 0, 0)
+                    ChunkResult::new(current_chunk, 0, len)
                         .with_context(context)
                         .with_boundary(true),
                 );
@@ -915,13 +929,14 @@ fn chunk_json_value(
         _ => {
             // Primitive value - just stringify
             let content = serde_json::to_string_pretty(value).unwrap_or_default();
+            let len = content.len();
             let context = if path.is_empty() {
                 None
             } else {
                 Some(path.join("."))
             };
             chunks.push(
-                ChunkResult::new(content, 0, 0)
+                ChunkResult::new(content, 0, len)
                     .with_context(context)
                     .with_boundary(false),
             );
@@ -956,12 +971,17 @@ fn chunk_yaml(content: &str, _config: &ChunkingConfig) -> Vec<ChunkResult> {
         let indent = line.len() - line.trim_start().len();
         let trimmed = line.trim();
 
-        // Check if this is a key line (contains : not in a string)
+        // Check if this is a YAML key line.
+        // A key line has an unquoted key followed by ':'. We check that ':' is not
+        // inside a URL (contains ://) and the line doesn't start with flow indicators.
         let is_key_line = !trimmed.starts_with('-')
             && !trimmed.starts_with('#')
-            && trimmed.contains(':')
             && !trimmed.starts_with('"')
-            && !trimmed.starts_with('\'');
+            && !trimmed.starts_with('\'')
+            && !trimmed.starts_with('{')
+            && !trimmed.starts_with('[')
+            && trimmed.contains(':')
+            && !trimmed.contains("://");
 
         if is_key_line {
             // Extract the key

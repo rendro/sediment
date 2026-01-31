@@ -696,7 +696,7 @@ async fn execute_recall(
         None => return CallToolResult::error("Missing parameters"),
     };
 
-    let limit = params.limit.unwrap_or(5);
+    let limit = params.limit.unwrap_or(5).min(100);
     let min_similarity = params.min_similarity.unwrap_or(0.3);
 
     let mut filters = ItemFilters::new().with_min_similarity(min_similarity);
@@ -803,9 +803,9 @@ async fn execute_recall(
         .instrument(tracing::info_span!("co_access")),
     );
 
-    // Periodic expired item cleanup: every 10th recall
+    // Periodic maintenance: every 10th recall
     let run_count = ctx
-        .consolidation_run_count
+        .recall_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if run_count % 10 == 9 {
         // Clustering
@@ -852,6 +852,19 @@ async fn execute_recall(
             }
             .instrument(tracing::info_span!("cleanup_expired")),
         );
+
+        // Consolidation queue cleanup: purge old processed entries
+        let access_db_path2 = ctx.access_db_path.clone();
+        tokio::spawn(
+            async move {
+                if let Ok(q) = crate::consolidation::ConsolidationQueue::open(&access_db_path2)
+                    && let Err(e) = q.cleanup_processed()
+                {
+                    tracing::warn!("consolidation queue cleanup failed: {}", e);
+                }
+            }
+            .instrument(tracing::info_span!("consolidation_cleanup")),
+        );
     }
 
     CallToolResult::success(serde_json::to_string_pretty(&result_json).unwrap())
@@ -866,7 +879,7 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
                 scope: None,
             });
 
-    let limit = params.limit.unwrap_or(10);
+    let limit = params.limit.unwrap_or(10).min(100);
 
     let mut filters = ItemFilters::new();
 

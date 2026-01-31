@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
-use sha2::{Digest, Sha256};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 use tracing::info;
 
@@ -16,7 +15,13 @@ pub const DEFAULT_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 /// Embedding dimension for the default model
 pub const EMBEDDING_DIM: usize = 384;
 
-/// Embedder for converting text to vectors
+/// Embedder for converting text to vectors.
+///
+/// # Thread Safety
+/// `Embedder` wraps `BertModel` and `Tokenizer` which are `Send + Sync`.
+/// It is shared via `Arc<Embedder>` across the server. All inference runs
+/// synchronously on the calling thread (via `rt.block_on`), so there are
+/// no cross-thread mutation concerns.
 pub struct Embedder {
     model: BertModel,
     tokenizer: Tokenizer,
@@ -213,49 +218,12 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
         .get("config.json")
         .map_err(|e| SedimentError::ModelLoading(format!("Failed to download config: {}", e)))?;
 
-    // TOFU: verify model integrity
-    verify_tofu_hash(&model_path, "model.safetensors")?;
-    verify_tofu_hash(&tokenizer_path, "tokenizer.json")?;
-    verify_tofu_hash(&config_path, "config.json")?;
+    // Integrity is ensured by the pinned git revision above.
+    // TOFU sidecar hashes were removed as they provide no additional security:
+    // both the model and hash files share the same directory permissions,
+    // so an attacker who can modify one can modify the other.
 
     Ok((model_path, tokenizer_path, config_path))
-}
-
-/// Compute SHA256 hash of a file.
-fn sha256_file(path: &Path) -> Result<String> {
-    let data = std::fs::read(path)
-        .map_err(|e| SedimentError::ModelLoading(format!("Failed to read file for hash: {}", e)))?;
-    let hash = Sha256::digest(&data);
-    Ok(format!("{:x}", hash))
-}
-
-/// Trust-on-first-use hash verification for model files.
-///
-/// On first download, stores the SHA256 hash in a `.sha256` sidecar file next to the model.
-/// On subsequent loads, verifies the file still matches the stored hash.
-fn verify_tofu_hash(file_path: &Path, label: &str) -> Result<()> {
-    let hash_path = file_path.with_extension("sha256");
-    let current_hash = sha256_file(file_path)?;
-
-    if hash_path.exists() {
-        let stored_hash = std::fs::read_to_string(&hash_path)
-            .map_err(|e| SedimentError::ModelLoading(format!("Failed to read hash file: {}", e)))?;
-        let stored_hash = stored_hash.trim();
-        if stored_hash != current_hash {
-            return Err(SedimentError::ModelLoading(format!(
-                "TOFU integrity check failed for {}: expected {}, got {}",
-                label, stored_hash, current_hash
-            )));
-        }
-        info!("TOFU hash verified for {}", label);
-    } else {
-        std::fs::write(&hash_path, &current_hash).map_err(|e| {
-            SedimentError::ModelLoading(format!("Failed to write hash file: {}", e))
-        })?;
-        info!("TOFU hash recorded for {}: {}", label, current_hash);
-    }
-
-    Ok(())
 }
 
 /// L2 normalize a tensor

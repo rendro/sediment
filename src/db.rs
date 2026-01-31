@@ -139,12 +139,12 @@ impl Database {
             })?;
         }
 
-        let db = connect(path.to_str().unwrap())
-            .execute()
-            .await
-            .map_err(|e| {
-                SedimentError::Database(format!("Failed to connect to database: {}", e))
-            })?;
+        let db = connect(path.to_str().ok_or_else(|| {
+            SedimentError::Database("Database path contains invalid UTF-8".to_string())
+        })?)
+        .execute()
+        .await
+        .map_err(|e| SedimentError::Database(format!("Failed to connect to database: {}", e)))?;
 
         let mut database = Self {
             db,
@@ -638,6 +638,9 @@ impl Database {
             crate::ListScope::Project => {
                 if let Some(ref pid) = self.project_id {
                     filter_parts.push(format!("project_id = '{}'", sanitize_sql_string(pid)));
+                } else {
+                    // No project context: return empty rather than silently listing all items
+                    return Ok(Vec::new());
                 }
             }
             crate::ListScope::Global => {
@@ -761,7 +764,14 @@ impl Database {
 
         item.expires_at = Some(expires_at);
 
-        // Insert-before-delete to avoid data loss on crash
+        // Delete first, then re-insert with updated expires_at.
+        // We must delete-then-insert (not insert-then-delete) because both rows
+        // share the same id, so a delete filter on id would remove both.
+        table
+            .delete(&format!("id = '{}'", sanitize_sql_string(id)))
+            .await
+            .map_err(|e| SedimentError::Database(format!("Delete for expire failed: {}", e)))?;
+
         let batch = item_to_batch(&item)?;
         let batches = RecordBatchIterator::new(vec![Ok(batch)], Arc::new(item_schema()));
         table
@@ -770,16 +780,23 @@ impl Database {
             .await
             .map_err(|e| SedimentError::Database(format!("Re-insert for expire failed: {}", e)))?;
 
-        table
-            .delete(&format!("id = '{}'", sanitize_sql_string(id)))
-            .await
-            .map_err(|e| SedimentError::Database(format!("Delete for expire failed: {}", e)))?;
-
         Ok(())
     }
 
-    /// Delete an item and its chunks
+    /// Delete an item and its chunks.
+    /// Returns `true` if the item existed, `false` if it was not found.
     pub async fn delete_item(&self, id: &str) -> Result<bool> {
+        // Check if item exists first
+        let table = match &self.items_table {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+
+        let exists = self.get_item(id).await?.is_some();
+        if !exists {
+            return Ok(false);
+        }
+
         // Delete chunks first
         if let Some(chunks_table) = &self.chunks_table {
             chunks_table
@@ -789,11 +806,6 @@ impl Database {
         }
 
         // Delete item
-        let table = match &self.items_table {
-            Some(t) => t,
-            None => return Ok(false),
-        };
-
         table
             .delete(&format!("id = '{}'", sanitize_sql_string(id)))
             .await
@@ -867,6 +879,11 @@ pub fn score_with_decay(
     access_count: u32,
     last_accessed_at: Option<i64>,
 ) -> f32 {
+    // Guard against NaN/Inf from corrupted data
+    if !similarity.is_finite() {
+        return 0.0;
+    }
+
     let reference_time = last_accessed_at.unwrap_or(created_at);
     let age_secs = (now - reference_time).max(0) as f64;
     let age_days = age_secs / 86400.0;
@@ -874,7 +891,8 @@ pub fn score_with_decay(
     let freshness = 1.0 / (1.0 + age_days / 30.0);
     let frequency = 1.0 + 0.1 * (1.0 + access_count as f64).ln();
 
-    similarity * (freshness * frequency) as f32
+    let result = similarity * (freshness * frequency) as f32;
+    if result.is_finite() { result } else { 0.0 }
 }
 
 // ==================== Helper Functions ====================
@@ -909,7 +927,8 @@ fn detect_content_type(content: &str) -> ContentType {
         return ContentType::Markdown;
     }
 
-    // Check for code (common patterns)
+    // Check for code (common patterns at start of lines to avoid false positives
+    // from English prose like "let me explain" or "import regulations")
     let code_patterns = [
         "fn ",
         "pub fn ",
@@ -925,7 +944,11 @@ fn detect_content_type(content: &str) -> ContentType {
         "impl ",
         "trait ",
     ];
-    if code_patterns.iter().any(|p| trimmed.contains(p)) {
+    let has_code_pattern = trimmed.lines().any(|line| {
+        let l = line.trim();
+        code_patterns.iter().any(|p| l.starts_with(p))
+    });
+    if has_code_pattern {
         return ContentType::Code;
     }
 

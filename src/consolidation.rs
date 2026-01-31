@@ -32,7 +32,8 @@ impl ConsolidationQueue {
             SedimentError::Database(format!("Failed to open consolidation database: {}", e))
         })?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .ok();
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS consolidation_queue (
@@ -107,6 +108,20 @@ impl ConsolidationQueue {
         }
 
         Ok(candidates)
+    }
+
+    /// Delete processed (non-pending) entries older than 7 days to prevent unbounded growth.
+    pub fn cleanup_processed(&self) -> Result<()> {
+        let cutoff = chrono::Utc::now().timestamp() - 7 * 86400;
+        self.conn
+            .execute(
+                "DELETE FROM consolidation_queue WHERE status != 'pending' AND created_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to cleanup consolidation queue: {}", e))
+            })?;
+        Ok(())
     }
 
     /// Mark a candidate as processed with the given status ("merged" or "linked").
@@ -264,11 +279,15 @@ async fn process_candidate(
                 // results by default but remain in the database.
                 let past = chrono::Utc::now() - chrono::Duration::seconds(1);
                 if let Err(e) = db.expire_item(&remove.id, past).await {
-                    // Fall back to hard delete if expire is not supported
-                    warn!("expire_item failed ({}), falling back to delete", e);
-                    db.delete_item(&remove.id).await?;
-                    if let Err(e) = graph.remove_node(&remove.id) {
-                        tracing::warn!("remove_node failed: {}", e);
+                    // expire_item is delete-then-insert, so a failure may mean the
+                    // item was already deleted. Only attempt hard delete if the item
+                    // still exists to avoid double-deleting.
+                    warn!("expire_item failed ({}), checking if item still exists", e);
+                    if let Ok(Some(_)) = db.get_item(&remove.id).await {
+                        db.delete_item(&remove.id).await?;
+                        if let Err(e2) = graph.remove_node(&remove.id) {
+                            tracing::warn!("remove_node failed: {}", e2);
+                        }
                     }
                 }
 
