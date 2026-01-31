@@ -205,13 +205,18 @@ fn handle_call_tool(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let window = ctx.rate_limit_window.load(Ordering::Relaxed);
+        let window = ctx.rate_limit_window.load(Ordering::SeqCst);
         if now_ms - window > 60_000 {
-            // Reset window
-            ctx.rate_limit_window.store(now_ms, Ordering::Relaxed);
-            ctx.rate_limit_count.store(1, Ordering::Relaxed);
+            // Reset window (use compare_exchange to avoid racing with another reset)
+            if ctx
+                .rate_limit_window
+                .compare_exchange(window, now_ms, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                ctx.rate_limit_count.store(1, Ordering::SeqCst);
+            }
         } else {
-            let count = ctx.rate_limit_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let count = ctx.rate_limit_count.fetch_add(1, Ordering::SeqCst) + 1;
             if count > MAX_CALLS_PER_MINUTE {
                 let result =
                     super::protocol::CallToolResult::error("Rate limit exceeded, try again later");

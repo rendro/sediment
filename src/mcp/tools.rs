@@ -62,7 +62,7 @@ pub fn get_tools() -> Vec<Tool> {
                     },
                     "replace": {
                         "type": "string",
-                        "description": "ID of an existing item to replace (atomically delete before storing)"
+                        "description": "ID of an existing item to replace (stores new item first, then deletes old)"
                     },
                     "related": {
                         "type": "array",
@@ -594,7 +594,11 @@ pub async fn recall_pipeline(
             result.similarity = (base_score * trust_bonus).min(1.0);
         }
 
-        results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+        results.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     // Record access

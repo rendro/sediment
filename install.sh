@@ -70,7 +70,7 @@ if curl -fsSL "$CHECKSUMS_URL" -o "${TMPDIR}/checksums.txt" 2>/dev/null; then
     fi
   fi
 else
-  echo "No checksums.txt available, skipping verification."
+  echo "WARNING: No checksums.txt available, binary integrity could not be verified." >&2
 fi
 
 tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"

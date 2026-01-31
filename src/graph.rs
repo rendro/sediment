@@ -225,6 +225,12 @@ impl GraphStore {
             return Ok(());
         }
 
+        let item_ids = if item_ids.len() > 3 {
+            &item_ids[..3]
+        } else {
+            item_ids
+        };
+
         let now = chrono::Utc::now().timestamp();
 
         for i in 0..item_ids.len() {
@@ -336,7 +342,9 @@ impl GraphStore {
 
         // Create edges on the new node
         for (neighbor, strength, rel_type, _) in &edges {
-            let _ = self.add_related_edge(to_id, neighbor, *strength, rel_type);
+            if let Err(e) = self.add_related_edge(to_id, neighbor, *strength, rel_type) {
+                tracing::warn!("transfer edge to {} failed: {}", neighbor, e);
+            }
         }
 
         Ok(())

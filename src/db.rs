@@ -535,7 +535,11 @@ impl Database {
         // Convert map to sorted vec
         let mut search_results: Vec<SearchResult> =
             results_map.into_values().map(|(r, _)| r).collect();
-        search_results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+        search_results.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         search_results.truncate(limit);
 
         Ok(search_results)
@@ -598,7 +602,11 @@ impl Database {
         }
 
         // Sort by similarity descending
-        conflicts.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+        conflicts.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(conflicts)
     }
@@ -753,12 +761,7 @@ impl Database {
         item.embedding = self.embedder.embed(&embedding_text)?;
         item.expires_at = Some(expires_at);
 
-        // Delete then re-insert with new expiration
-        table
-            .delete(&format!("id = '{}'", sanitize_sql_string(id)))
-            .await
-            .map_err(|e| SedimentError::Database(format!("Delete for expire failed: {}", e)))?;
-
+        // Insert-before-delete to avoid data loss on crash
         let batch = item_to_batch(&item)?;
         let batches = RecordBatchIterator::new(vec![Ok(batch)], Arc::new(item_schema()));
         table
@@ -766,6 +769,11 @@ impl Database {
             .execute()
             .await
             .map_err(|e| SedimentError::Database(format!("Re-insert for expire failed: {}", e)))?;
+
+        table
+            .delete(&format!("id = '{}'", sanitize_sql_string(id)))
+            .await
+            .map_err(|e| SedimentError::Database(format!("Delete for expire failed: {}", e)))?;
 
         Ok(())
     }
@@ -823,6 +831,7 @@ impl Database {
         };
 
         let now = Utc::now().timestamp();
+        // now is a system-generated i64 timestamp, no string sanitization needed
         let filter = format!("expires_at IS NOT NULL AND expires_at < {}", now);
 
         // Count how many will be deleted

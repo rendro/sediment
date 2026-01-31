@@ -215,6 +215,8 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
 
     // TOFU: verify model integrity
     verify_tofu_hash(&model_path, "model.safetensors")?;
+    verify_tofu_hash(&tokenizer_path, "tokenizer.json")?;
+    verify_tofu_hash(&config_path, "config.json")?;
 
     Ok((model_path, tokenizer_path, config_path))
 }
