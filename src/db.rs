@@ -6,12 +6,22 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Sanitize a string value for use in LanceDB SQL filter expressions
-/// by escaping backslashes and single quotes to prevent injection attacks.
+/// Sanitize a string value for use in LanceDB SQL filter expressions.
+///
+/// LanceDB uses DataFusion as its SQL engine. Since `only_if()` doesn't support
+/// parameterized queries, we must escape string literals. This function handles:
+/// - Null bytes: stripped (could truncate strings in some parsers)
+/// - Backslashes: escaped to prevent escape sequence injection
+/// - Single quotes: doubled per SQL standard
+/// - Semicolons: stripped to prevent statement injection
+/// - Comment sequences: `--` and `/*` stripped to prevent comment injection
 fn sanitize_sql_string(s: &str) -> String {
     s.replace('\0', "")
         .replace('\\', "\\\\")
         .replace('\'', "''")
+        .replace(';', "")
+        .replace("--", "")
+        .replace("/*", "")
 }
 
 use arrow_array::{
@@ -41,6 +51,11 @@ const CONFLICT_SIMILARITY_THRESHOLD: f32 = 0.85;
 
 /// Maximum number of conflicts to return
 const CONFLICT_SEARCH_LIMIT: usize = 5;
+
+/// Maximum number of chunks per item to prevent CPU exhaustion during embedding.
+/// With default config (800 char chunks), 1MB content produces ~1250 chunks.
+/// Cap at 200 to bound embedding time while covering most legitimate content.
+const MAX_CHUNKS_PER_ITEM: usize = 200;
 
 /// Database wrapper for LanceDB
 pub struct Database {
@@ -320,7 +335,17 @@ impl Database {
             // Detect content type for smart chunking
             let content_type = detect_content_type(&item.content);
             let config = ChunkingConfig::default();
-            let chunk_results = chunk_content(&item.content, content_type, &config);
+            let mut chunk_results = chunk_content(&item.content, content_type, &config);
+
+            // Cap chunk count to prevent CPU exhaustion from pathological inputs
+            if chunk_results.len() > MAX_CHUNKS_PER_ITEM {
+                tracing::warn!(
+                    "Chunk count {} exceeds limit {}, truncating",
+                    chunk_results.len(),
+                    MAX_CHUNKS_PER_ITEM
+                );
+                chunk_results.truncate(MAX_CHUNKS_PER_ITEM);
+            }
 
             for (i, chunk_result) in chunk_results.iter().enumerate() {
                 let mut chunk = Chunk::new(&item.id, i, &chunk_result.content);
@@ -1381,7 +1406,6 @@ mod tests {
 
     #[test]
     fn test_sanitize_sql_string_escapes_quotes_and_backslashes() {
-        // Fix #3: Backslashes should be escaped too
         assert_eq!(sanitize_sql_string("hello"), "hello");
         assert_eq!(sanitize_sql_string("it's"), "it''s");
         assert_eq!(sanitize_sql_string(r"a\'b"), r"a\\''b");
@@ -1391,8 +1415,36 @@ mod tests {
     #[test]
     fn test_sanitize_sql_string_strips_null_bytes() {
         assert_eq!(sanitize_sql_string("abc\0def"), "abcdef");
-        assert_eq!(sanitize_sql_string("\0' OR 1=1 --"), "'' OR 1=1 --");
+        assert_eq!(sanitize_sql_string("\0' OR 1=1 --"), "'' OR 1=1 ");
         assert_eq!(sanitize_sql_string("clean"), "clean");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_strips_semicolons() {
+        assert_eq!(sanitize_sql_string("a; DROP TABLE items"), "a DROP TABLE items");
+        assert_eq!(sanitize_sql_string("normal;"), "normal");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_strips_comments() {
+        // Line comments (-- stripped, leaving extra space)
+        assert_eq!(sanitize_sql_string("val' -- comment"), "val''  comment");
+        // Block comments (/* stripped, leaving extra space)
+        assert_eq!(sanitize_sql_string("val' /* block */"), "val''  block */");
+        // Nested attempts
+        assert_eq!(sanitize_sql_string("a--b--c"), "abc");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_adversarial_inputs() {
+        // Classic SQL injection
+        assert_eq!(sanitize_sql_string("'; DROP TABLE items;--"), "'' DROP TABLE items");
+        // Unicode escapes (should pass through harmlessly)
+        assert_eq!(sanitize_sql_string("hello\u{200B}world"), "hello\u{200B}world");
+        // Empty string
+        assert_eq!(sanitize_sql_string(""), "");
+        // Only special chars
+        assert_eq!(sanitize_sql_string("\0;\0"), "");
     }
 
     #[test]

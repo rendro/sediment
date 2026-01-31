@@ -166,7 +166,7 @@ fn handle_request(rt: &Runtime, ctx: &ServerContext, line: &str) -> Option<Respo
             return Some(Response::error(
                 None,
                 PARSE_ERROR,
-                &format!("Parse error: {}", e),
+                "Parse error: invalid JSON-RPC request",
             ));
         }
     };
@@ -246,7 +246,8 @@ fn handle_call_tool(
         Some(p) => match serde_json::from_value(p) {
             Ok(p) => p,
             Err(e) => {
-                return Response::error(id, INVALID_PARAMS, &format!("Invalid params: {}", e));
+                tracing::debug!("Invalid tool call params: {}", e);
+                return Response::error(id, INVALID_PARAMS, "Invalid params");
             }
         },
         None => {

@@ -344,7 +344,10 @@ async fn execute_store(
     let params: StoreParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
-            Err(e) => return CallToolResult::error(format!("Invalid parameters: {}", e)),
+            Err(e) => {
+                tracing::debug!("Parameter validation failed: {}", e);
+                return CallToolResult::error("Invalid parameters");
+            }
         },
         None => return CallToolResult::error("Missing parameters"),
     };
@@ -359,6 +362,63 @@ async fn execute_store(
             params.content.len(),
             MAX_CONTENT_BYTES
         ));
+    }
+
+    // Validate field sizes to prevent abuse
+    const MAX_TITLE_LEN: usize = 1000;
+    const MAX_SOURCE_LEN: usize = 2000;
+    const MAX_TAG_LEN: usize = 200;
+    const MAX_TAG_COUNT: usize = 50;
+    const MAX_METADATA_BYTES: usize = 100_000;
+
+    if let Some(ref title) = params.title {
+        if title.len() > MAX_TITLE_LEN {
+            return CallToolResult::error(format!(
+                "Title too large: {} bytes (max {})",
+                title.len(),
+                MAX_TITLE_LEN
+            ));
+        }
+    }
+
+    if let Some(ref source) = params.source {
+        if source.len() > MAX_SOURCE_LEN {
+            return CallToolResult::error(format!(
+                "Source too large: {} bytes (max {})",
+                source.len(),
+                MAX_SOURCE_LEN
+            ));
+        }
+    }
+
+    if let Some(ref tags) = params.tags {
+        if tags.len() > MAX_TAG_COUNT {
+            return CallToolResult::error(format!(
+                "Too many tags: {} (max {})",
+                tags.len(),
+                MAX_TAG_COUNT
+            ));
+        }
+        for tag in tags {
+            if tag.len() > MAX_TAG_LEN {
+                return CallToolResult::error(format!(
+                    "Tag too large: {} bytes (max {})",
+                    tag.len(),
+                    MAX_TAG_LEN
+                ));
+            }
+        }
+    }
+
+    if let Some(ref metadata) = params.metadata {
+        let meta_size = metadata.to_string().len();
+        if meta_size > MAX_METADATA_BYTES {
+            return CallToolResult::error(format!(
+                "Metadata too large: {} bytes (max {})",
+                meta_size,
+                MAX_METADATA_BYTES
+            ));
+        }
     }
 
     // Parse scope
@@ -701,14 +761,25 @@ pub async fn recall_pipeline(
                 for (neighbor_id, rel_type) in &neighbor_info {
                     if let Some(item) = item_map.get(neighbor_id.as_str()) {
                         let sr = crate::item::SearchResult::from_item(item, 0.05);
-                        graph_expanded.push(json!({
+                        let mut entry = json!({
                             "id": sr.id,
-                            "content": sr.content,
                             "similarity": "graph",
                             "created": sr.created_at.to_rfc3339(),
                             "graph_expanded": true,
                             "rel_type": rel_type,
-                        }));
+                        });
+                        // Only include content for same-project or global items
+                        let same_project = match (db.project_id(), item.project_id.as_deref()) {
+                            (Some(current), Some(item_pid)) => current == item_pid,
+                            (_, None) => true,
+                            _ => false,
+                        };
+                        if same_project {
+                            entry["content"] = json!(sr.content);
+                        } else {
+                            entry["cross_project"] = json!(true);
+                        }
+                        graph_expanded.push(entry);
                     }
                 }
             }
@@ -732,11 +803,21 @@ pub async fn recall_pipeline(
 
                 for (co_id, co_count) in &co_info {
                     if let Some(item) = item_map.get(co_id.as_str()) {
-                        suggested.push(json!({
+                        let same_project = match (db.project_id(), item.project_id.as_deref()) {
+                            (Some(current), Some(item_pid)) => current == item_pid,
+                            (_, None) => true,
+                            _ => false,
+                        };
+                        let mut entry = json!({
                             "id": item.id,
-                            "content": truncate(&item.content, 100),
                             "reason": format!("frequently recalled with result (co-accessed {} times)", co_count),
-                        }));
+                        });
+                        if same_project {
+                            entry["content"] = json!(truncate(&item.content, 100));
+                        } else {
+                            entry["cross_project"] = json!(true);
+                        }
+                        suggested.push(entry);
                     }
                 }
             }
@@ -761,7 +842,10 @@ async fn execute_recall(
     let params: RecallParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
-            Err(e) => return CallToolResult::error(format!("Invalid parameters: {}", e)),
+            Err(e) => {
+                tracing::debug!("Parameter validation failed: {}", e);
+                return CallToolResult::error("Invalid parameters");
+            }
         },
         None => return CallToolResult::error("Missing parameters"),
     };
@@ -1033,7 +1117,10 @@ async fn execute_forget(
     let params: ForgetParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
-            Err(e) => return CallToolResult::error(format!("Invalid parameters: {}", e)),
+            Err(e) => {
+                tracing::debug!("Parameter validation failed: {}", e);
+                return CallToolResult::error("Invalid parameters");
+            }
         },
         None => return CallToolResult::error("Missing parameters"),
     };
@@ -1088,7 +1175,10 @@ async fn execute_connections(
     let params: ConnectionsParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
-            Err(e) => return CallToolResult::error(format!("Invalid parameters: {}", e)),
+            Err(e) => {
+                tracing::debug!("Parameter validation failed: {}", e);
+                return CallToolResult::error("Invalid parameters");
+            }
         },
         None => return CallToolResult::error("Missing parameters"),
     };
@@ -1132,9 +1222,20 @@ async fn execute_connections(
                     obj["count"] = json!(count);
                 }
 
-                // Add content preview from batch
+                // Add content preview from batch, but only if the connected item
+                // belongs to the same project (or is global). This prevents
+                // cross-project content leakage via graph edges.
                 if let Some(item) = item_map.get(conn.target_id.as_str()) {
-                    obj["content_preview"] = json!(truncate(&item.content, 80));
+                    let same_project = match (&ctx.project_id, &item.project_id) {
+                        (Some(current), Some(item_pid)) => current == item_pid,
+                        (_, None) => true, // Global items are visible to all
+                        _ => false,
+                    };
+                    if same_project {
+                        obj["content_preview"] = json!(truncate(&item.content, 80));
+                    } else {
+                        obj["cross_project"] = json!(true);
+                    }
                 }
 
                 conn_json.push(obj);
