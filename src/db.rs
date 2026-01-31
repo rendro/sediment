@@ -920,7 +920,14 @@ impl Database {
         let mut ids = Vec::new();
         for batch in &batches {
             if let Some(id_col) = batch.column_by_name("id") {
-                let id_array = id_col.as_any().downcast_ref::<StringArray>().unwrap();
+                let id_array = id_col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        SedimentError::Database(
+                            "id column is not StringArray in expired items query".to_string(),
+                        )
+                    })?;
                 for i in 0..id_array.len() {
                     if !id_array.is_null(i) {
                         ids.push(id_array.value(i).to_string());
@@ -1358,6 +1365,15 @@ mod tests {
         // freshness = 1/(1+3) = 0.25
         let expected = 0.8 * 0.25;
         assert!((score - expected).abs() < 0.001, "got {}", score);
+    }
+
+    #[test]
+    fn test_downcast_ref_returns_none_for_wrong_type() {
+        // Verifies that downcast_ref returns None (not panic) for wrong types,
+        // which is what our fix relies on via ok_or_else
+        let arr = Int32Array::from(vec![1, 2, 3]);
+        let result = arr.as_any().downcast_ref::<StringArray>();
+        assert!(result.is_none(), "downcast_ref should return None for wrong type");
     }
 
     #[test]

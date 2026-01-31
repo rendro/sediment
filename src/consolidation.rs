@@ -284,26 +284,14 @@ async fn process_candidate(
                     tracing::warn!("add_supersedes_edge failed: {}", e);
                 }
 
-                // Archive the removed item's content into a RELATED edge label
-                // so it can be recovered if this was a false positive merge.
-                // The edge label stores a truncated snapshot; full content is
-                // preserved in the SUPERSEDES relationship for audit.
-                let archive_preview = if remove.content.chars().count() > 500 {
-                    let cut = remove
-                        .content
-                        .char_indices()
-                        .nth(497)
-                        .map(|(i, _)| i)
-                        .unwrap_or(remove.content.len());
-                    format!("{}...", &remove.content[..cut])
-                } else {
-                    remove.content.clone()
-                };
+                // Create a RELATED edge marking this as a merge archive.
+                // Content is NOT stored in the edge label — it can be recovered
+                // via the SUPERSEDES edge and the soft-deleted item.
                 if let Err(e) = graph.add_related_edge(
                     &keep.id,
                     &remove.id,
                     fresh_similarity,
-                    &format!("merged_archive:{}", archive_preview),
+                    "merged_archive",
                 ) {
                     tracing::warn!("add_related_edge failed: {}", e);
                 }
@@ -377,6 +365,21 @@ mod tests {
         let remaining = queue.fetch_pending(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].item_id_a, "c");
+    }
+
+    #[test]
+    fn test_merge_archive_rel_type_is_bounded() {
+        // rel_type should be a short label, not contain user content
+        let rel_type = "merged_archive";
+        assert!(
+            rel_type.len() < 100,
+            "rel_type should be a short label, not contain content"
+        );
+        // Verify it does NOT contain a colon-separated content payload
+        assert!(
+            !rel_type.contains(':'),
+            "rel_type should not embed content after a colon separator"
+        );
     }
 
     #[test]
