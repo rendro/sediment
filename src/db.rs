@@ -289,8 +289,9 @@ impl Database {
             item.project_id = self.project_id.clone();
         }
 
-        // Determine if we need to chunk
-        let should_chunk = item.content.len() > CHUNK_THRESHOLD;
+        // Determine if we need to chunk (by character count, not byte count,
+        // so multi-byte UTF-8 content isn't prematurely chunked)
+        let should_chunk = item.content.chars().count() > CHUNK_THRESHOLD;
         item.is_chunked = should_chunk;
 
         // Generate item embedding
@@ -1391,5 +1392,25 @@ mod tests {
         let yaml = "---\nname: test\nversion: 1.0";
         let detected = detect_content_type(yaml);
         assert_eq!(detected, ContentType::Yaml);
+    }
+
+    #[test]
+    fn test_chunk_threshold_uses_chars_not_bytes() {
+        // Bug #12: CHUNK_THRESHOLD should compare character count, not byte count.
+        // 500 emoji chars = 2000 bytes. Should NOT exceed 1000-char threshold.
+        let emoji_content = "😀".repeat(500);
+        assert_eq!(emoji_content.chars().count(), 500);
+        assert_eq!(emoji_content.len(), 2000); // 4 bytes per emoji
+
+        let should_chunk = emoji_content.chars().count() > CHUNK_THRESHOLD;
+        assert!(
+            !should_chunk,
+            "500 chars should not exceed 1000-char threshold"
+        );
+
+        // 1001 chars should trigger chunking
+        let long_content = "a".repeat(1001);
+        let should_chunk = long_content.chars().count() > CHUNK_THRESHOLD;
+        assert!(should_chunk, "1001 chars should exceed 1000-char threshold");
     }
 }

@@ -1041,6 +1041,9 @@ async fn execute_connections(
 fn truncate(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
         s.to_string()
+    } else if max_len <= 3 {
+        // Not enough room for "..." suffix; just take max_len chars
+        s.chars().take(max_len).collect()
     } else {
         let cut = s
             .char_indices()
@@ -1048,5 +1051,28 @@ fn truncate(s: &str, max_len: usize) -> String {
             .map(|(i, _)| i)
             .unwrap_or(s.len());
         format!("{}...", &s[..cut])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_small_max_len() {
+        // Bug #25: truncate should not panic when max_len < 3
+        assert_eq!(truncate("hello", 0), "");
+        assert_eq!(truncate("hello", 1), "h");
+        assert_eq!(truncate("hello", 2), "he");
+        assert_eq!(truncate("hello", 3), "hel");
+        assert_eq!(truncate("hi", 3), "hi"); // shorter than max, no truncation
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("hello!", 5), "he...");
+    }
+
+    #[test]
+    fn test_truncate_unicode() {
+        assert_eq!(truncate("héllo wörld", 5), "hé...");
+        assert_eq!(truncate("日本語テスト", 4), "日...");
     }
 }

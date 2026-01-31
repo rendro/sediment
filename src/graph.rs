@@ -105,9 +105,11 @@ impl GraphStore {
 
     /// Remove a Memory node and all its edges from the graph.
     pub fn remove_node(&self, id: &str) -> Result<()> {
+        // Preserve incoming SUPERSEDES edges (where this node is the to_id)
+        // so that lineage/provenance chains remain intact after node removal.
         self.conn
             .execute(
-                "DELETE FROM graph_edges WHERE from_id = ?1 OR to_id = ?1",
+                "DELETE FROM graph_edges WHERE from_id = ?1 OR (to_id = ?1 AND edge_type != 'supersedes')",
                 params![id],
             )
             .map_err(|e| SedimentError::Database(format!("Failed to remove edges: {}", e)))?;
@@ -188,7 +190,8 @@ impl GraphStore {
              FROM graph_edges
              WHERE (from_id IN ({ph}) OR to_id IN ({ph}))
                AND edge_type IN ('related', 'supersedes')
-               AND strength >= ?{strength_idx}"
+               AND strength >= ?{strength_idx}
+             LIMIT 100"
         );
 
         let mut stmt = self.conn.prepare(&sql).map_err(|e| {
@@ -235,6 +238,9 @@ impl GraphStore {
             return Ok(());
         }
 
+        // Performance optimization: limit co-access recording to the top 3 items
+        // by position to bound the O(n^2) pair generation. Items beyond position 3
+        // in recall results won't have co-access edges recorded.
         let item_ids = if item_ids.len() > 3 {
             &item_ids[..3]
         } else {
@@ -575,5 +581,47 @@ mod tests {
         );
         let neighbor_ids: Vec<&str> = neighbors.iter().map(|(id, _, _)| id.as_str()).collect();
         assert!(neighbor_ids.contains(&"friend"));
+    }
+
+    #[test]
+    fn test_remove_node_preserves_incoming_supersedes() {
+        // Bug #4: remove_node should preserve incoming SUPERSEDES edges for lineage
+        let graph = open_test_graph();
+        let now = chrono::Utc::now().timestamp();
+        graph.add_node("new", Some("proj"), now).unwrap();
+        graph.add_node("old", Some("proj"), now).unwrap();
+
+        // Simulate replace workflow: create SUPERSEDES edge new -> old
+        graph.add_supersedes_edge("new", "old").unwrap();
+
+        // Now remove the old node (as execute_store does)
+        graph.remove_node("old").unwrap();
+
+        // The SUPERSEDES edge (new -> old) should survive because old is the to_id
+        let connections = graph.get_full_connections("new").unwrap();
+        assert_eq!(connections.len(), 1, "SUPERSEDES edge should be preserved");
+        assert_eq!(connections[0].target_id, "old");
+        assert_eq!(connections[0].rel_type, "supersedes");
+    }
+
+    #[test]
+    fn test_get_neighbors_bounded() {
+        // Bug #3: get_neighbors should return at most 100 results
+        let graph = open_test_graph();
+        let now = chrono::Utc::now().timestamp();
+        graph.add_node("center", Some("proj"), now).unwrap();
+
+        for i in 0..150 {
+            let id = format!("n{}", i);
+            graph.add_node(&id, Some("proj"), now).unwrap();
+            graph.add_related_edge("center", &id, 0.9, "test").unwrap();
+        }
+
+        let neighbors = graph.get_neighbors(&["center"], 0.0).unwrap();
+        assert!(
+            neighbors.len() <= 100,
+            "get_neighbors should return at most 100, got {}",
+            neighbors.len()
+        );
     }
 }

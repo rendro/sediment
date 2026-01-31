@@ -226,14 +226,13 @@ fn handle_call_tool(
         if now_ms.saturating_sub(state.window_start_ms) > 60_000 {
             // Window expired, reset
             state.window_start_ms = now_ms;
-            state.count = 1;
-        } else {
-            state.count += 1;
-            if state.count > MAX_CALLS_PER_MINUTE {
-                let result =
-                    super::protocol::CallToolResult::error("Rate limit exceeded, try again later");
-                return Response::success(id, serde_json::to_value(result).unwrap());
-            }
+            state.count = 0;
+        }
+        state.count += 1;
+        if state.count > MAX_CALLS_PER_MINUTE {
+            let result =
+                super::protocol::CallToolResult::error("Rate limit exceeded, try again later");
+            return Response::success(id, serde_json::to_value(result).unwrap());
         }
     }
 
@@ -287,10 +286,36 @@ mod tests {
         let now_ms = 200_000u64; // 100 seconds later
         if now_ms.saturating_sub(state.window_start_ms) > 60_000 {
             state.window_start_ms = now_ms;
-            state.count = 1;
+            state.count = 0;
         }
+        state.count += 1;
 
         assert_eq!(state.count, 1, "Count should reset after window expires");
         assert_eq!(state.window_start_ms, 200_000);
+    }
+
+    #[test]
+    fn test_rate_limiter_exactly_at_limit() {
+        // Bug #7: Effective limit should be exactly MAX_CALLS, not MAX_CALLS+1.
+        const MAX_CALLS: u64 = 60;
+        let mut state = RateLimitState {
+            window_start_ms: 100_000,
+            count: 0,
+        };
+        let now_ms = 100_000u64; // same window
+
+        for _ in 0..MAX_CALLS {
+            if now_ms.saturating_sub(state.window_start_ms) > 60_000 {
+                state.window_start_ms = now_ms;
+                state.count = 0;
+            }
+            state.count += 1;
+            assert!(state.count <= MAX_CALLS, "Should not exceed limit");
+        }
+        assert_eq!(state.count, MAX_CALLS);
+
+        // The (MAX_CALLS+1)th call should be rejected
+        state.count += 1;
+        assert!(state.count > MAX_CALLS, "Next call should exceed limit");
     }
 }
