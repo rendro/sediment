@@ -289,7 +289,7 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
                 "recall" => execute_recall(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
                 "list" => execute_list(&mut db, args_clone).await,
                 "forget" => execute_forget(&mut db, &graph, ctx_ref, args_clone).await,
-                "connections" => execute_connections(&mut db, &graph, args_clone).await,
+                "connections" => execute_connections(&mut db, &graph, ctx_ref, args_clone).await,
                 _ => return Ok(CallToolResult::error(format!("Unknown tool: {}", name_ref))),
             };
 
@@ -1082,6 +1082,7 @@ async fn execute_forget(
 async fn execute_connections(
     db: &mut Database,
     graph: &GraphStore,
+    ctx: &ServerContext,
     args: Option<Value>,
 ) -> CallToolResult {
     let params: ConnectionsParams = match args {
@@ -1092,11 +1093,22 @@ async fn execute_connections(
         None => return CallToolResult::error("Missing parameters"),
     };
 
-    // Verify item exists
+    // Verify item exists and belongs to the current project
     match db.get_item(&params.id).await {
+        Ok(Some(item)) => {
+            if let Some(ref current_pid) = ctx.project_id {
+                if let Some(ref item_pid) = item.project_id {
+                    if item_pid != current_pid {
+                        return CallToolResult::error(format!(
+                            "Cannot view connections for item {} from a different project",
+                            params.id
+                        ));
+                    }
+                }
+            }
+        }
         Ok(None) => return CallToolResult::error(format!("Item not found: {}", params.id)),
         Err(e) => return sanitized_error("Failed to get item", e),
-        Ok(Some(_)) => {}
     }
 
     match graph.get_full_connections(&params.id) {

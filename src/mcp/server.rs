@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -92,17 +92,30 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
         let mut line = String::new();
         loop {
             line.clear();
-            let bytes_read = reader.read_line(&mut line).context("Failed to read line")?;
+            // Use Read::take to bound memory before the newline is found.
+            // Without this, read_line would buffer an unlimited amount of data
+            // if the client never sends a newline character.
+            let bytes_read = (&mut reader)
+                .take((MAX_LINE_BYTES + 1) as u64)
+                .read_line(&mut line)
+                .context("Failed to read line")?;
             if bytes_read == 0 {
                 break; // EOF
             }
 
-            if line.len() > MAX_LINE_BYTES {
+            if line.len() > MAX_LINE_BYTES
+                || (line.len() >= MAX_LINE_BYTES && !line.ends_with('\n'))
+            {
                 tracing::error!(
                     "Rejecting oversized request: {} bytes (max {})",
                     line.len(),
                     MAX_LINE_BYTES
                 );
+                // Drain remaining bytes until newline or EOF to resync the stream
+                let mut drain = Vec::new();
+                if !line.ends_with('\n') {
+                    let _ = reader.read_until(b'\n', &mut drain);
+                }
                 let response = Response::error(
                     None,
                     INVALID_REQUEST,
