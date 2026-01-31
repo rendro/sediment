@@ -1,232 +1,179 @@
 # Security & Code Audit Report
 
-**Date:** 2026-01-31 (updated)
+**Date:** 2026-01-31
 **Scope:** Full repository audit of sediment-mcp v0.2.1
 **Auditor:** Automated code review
-**Based on:** Latest main branch (commit 55a9e97)
+**Based on:** Latest main branch merged into `claude/audit-repository-DY9FC`
 
 ---
 
-## Changes Since Previous Audit
+## Validation of Previously Reported Issues
 
-The main branch addressed three findings from the initial audit:
+### Fixed (17 of 18 tracked issues resolved)
 
-1. **FIXED: LanceDB filter injection (#1)** — A `sanitize_sql_string()` function was added to `db.rs:11-13` that escapes single quotes. All LanceDB filter interpolation sites now use it. **Downgraded from CRITICAL to LOW** (see #1 below for residual concerns).
-
-2. **FIXED: Content size limit (#3)** — A 1MB (`MAX_CONTENT_BYTES = 1_000_000`) limit was added at `tools.rs:337-344`. Content exceeding this is rejected before embedding.
-
-3. **FIXED: Destructive consolidation merge (#8)** — Consolidation now uses soft-deletion via `expire_item()` (`consolidation.rs:247-253`) instead of hard-deleting merged items. An archive preview is also stored in a RELATED edge label. Falls back to hard delete only if expire fails.
-
-4. **FIXED: Replace operation ordering** — The replace flow was changed to store-before-delete (`tools.rs:460-468`), eliminating the crash-window data loss. The old item is only deleted after the new one is successfully stored.
+| # | Issue | Status | Verification |
+|---|-------|--------|-------------|
+| 1 | LanceDB filter injection | **FIXED** | `sanitize_sql_string()` at `db.rs:11-13` escapes single quotes. All filter sites use it including `expire_item` (`db.rs:758`), `delete_item` (`db.rs:778,790`), `get_item` (`db.rs:687`), `get_items_batch` (`db.rs:719`), `list_items` (`db.rs:635`). |
+| 2 | `truncate()` UTF-8 panic | **FIXED** | `tools.rs:1018-1029` now uses `s.chars().count()` and `s.char_indices().nth()` for safe slicing. `consolidation.rs:242-249` also uses `char_indices().nth(497)`. `main.rs:339` now uses `chars().count()` consistently. |
+| 3 | CLAUDE.md schema mismatch | **FIXED** | `CLAUDE.md:106-143` now documents the actual schema: `from_id`, `to_id`, `edge_type`, `rel_type`, `count`, `last_at`, `UNIQUE(from_id, to_id, edge_type)`. Matches `graph.rs:59-68` exactly. |
+| 4 | Generated instructions say "4 tools" | **FIXED** | `main.rs:358` now says "## Tools (5 total)" and lists all 5 tools including `connections`. |
+| 5 | Duplicate `boost_similarity` | **FIXED** | `db.rs:27` now imports `use crate::boost_similarity;`. No private copy exists in `db.rs` anymore. |
+| 6 | Similarity exceeds 1.0 | **FIXED** | `tools.rs:594` now has `.min(1.0)` cap. |
+| 7 | Silent error swallowing | **FIXED** | All `let _ = ...` sites in `tools.rs` and `consolidation.rs` replaced with `if let Err(e) = ... { tracing::warn!(...) }`. |
+| 8 | `timestamp_opt().unwrap()` panic | **FIXED** | `db.rs:1061-1063` and `db.rs:1070-1072` now use `.single().unwrap_or_else(Utc::now)`. |
+| 9 | Inconsistent WAL mode | **FIXED** | `access.rs:33` and `consolidation.rs:35` both now set `PRAGMA journal_mode=WAL;`. |
+| 10 | Fire-and-forget tasks unmonitored | **FIXED** | `tools.rs:789-800` and `tools.rs:809-832` now use `.instrument(tracing::info_span!(...))` and log errors within the spawned futures. |
+| 11 | No rate limiting | **FIXED** | `server.rs:202-221` implements a 60-calls-per-minute window using `AtomicU64`. |
+| 12 | TOCTOU race in conflict detection | **ACCEPTED** | Low severity with single-client MCP over stdio. Not fixed but risk is negligible. |
+| 13 | Model download without integrity check | **FIXED** | `embedder.rs:198-201` pins revision `e4ce9877abf3edfe10b0d82785e83bdcb973e22e`. `embedder.rs:217` calls `verify_tofu_hash()` which implements trust-on-first-use SHA256 verification (`embedder.rs:234-257`). |
+| 14 | `split_at_sentences` ASCII-only | **FIXED** | `chunker.rs:119` now matches `'.' | '?' | '!' | '。' | '？' | '！'` using char comparison instead of byte comparison. |
+| 15 | Unused `jsonrpc-core` dependency | **FIXED** | Removed from `Cargo.toml`. Not present. |
+| 16 | `lib.rs` docstring says "4 tools" | **FIXED** | `lib.rs:9` now says "5 tools". |
+| 17 | No expiration cleanup | **FIXED** | `db.rs:818-841` implements `cleanup_expired()`. `tools.rs:814-831` triggers it every 10th recall. |
+| 18 | Config file permissions | **EXCLUDED** | Per user request, not tracked. |
+| 19 | `find_project_root` unbounded traversal | **FIXED** | `lib.rs:207-209` now has `depth >= 100` guard. |
 
 ---
 
-## Remaining Issues
+## Fresh Audit: New Issues Found
 
-### 1. Residual injection risk via `sanitize_sql_string`
+### NEW-1. `partial_cmp().unwrap()` panics on NaN similarity scores
 
-**Severity: LOW** (downgraded from CRITICAL)
+**Severity: MEDIUM**
 
-The new `sanitize_sql_string()` function at `db.rs:11-13` escapes single quotes by doubling them (`'` → `''`). This is the standard SQL escaping approach and handles the primary injection vector.
+Three sort operations use `partial_cmp(...).unwrap()` which panics if any similarity score is `NaN`:
 
-However, there is one site that was **not updated**: `expire_item()` at `db.rs:754`:
+- `src/db.rs:538` — `search_results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());`
+- `src/db.rs:601` — `conflicts.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());`
+- `src/mcp/tools.rs:597` — `results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());`
+
+A `NaN` can occur if the embedding is all zeros (e.g., empty input after truncation, model failure returning zeros), since cosine similarity involves division. The L2 normalization in `embedder.rs:260-272` divides by the norm — if the norm is zero, the result contains `NaN` values that propagate through similarity calculations.
+
+**Recommendation:** Replace `.unwrap()` with `.unwrap_or(std::cmp::Ordering::Equal)` or use `f32::total_cmp()`.
+
+---
+
+### NEW-2. Rate limiter race condition allows burst beyond limit
+
+**Severity: LOW**
+
+`server.rs:208-221` — The rate limiter uses `Relaxed` ordering for both the window check and the count increment. Under concurrent access (even though MCP is typically single-client), the following race exists:
+
+1. Thread A reads `window` and sees it's stale, enters the reset branch
+2. Thread B reads `window` before A writes, also enters the reset branch
+3. Both threads reset the counter to 1, effectively allowing 2x the rate limit
+
+Since MCP runs over stdio with `block_on`, true concurrency is unlikely here, but the logic is incorrect in principle. Additionally, the window-reset branch stores count=1 without checking if another thread already reset it.
+
+---
+
+### NEW-3. TOFU hash verification only covers `model.safetensors`, not `tokenizer.json` or `config.json`
+
+**Severity: LOW**
+
+`embedder.rs:217` only verifies `model.safetensors`:
 ```rust
-table.delete(&format!("id = '{}'", id))
+verify_tofu_hash(&model_path, "model.safetensors")?;
 ```
-This line in `expire_item` does not use `sanitize_sql_string`. Currently `expire_item` is only called from consolidation with internally-generated IDs, so the practical risk is minimal, but it breaks the consistent sanitization pattern.
 
-Additionally, the `sanitize_sql_string` approach only escapes single quotes. If LanceDB's filter language supports backslash escapes or other special characters, this may be insufficient. A UUID format validation would be a more robust defense-in-depth measure.
+The `tokenizer.json` and `config.json` files are also downloaded and loaded but not hash-verified. A compromised tokenizer could manipulate how text is split into tokens, affecting embedding quality or causing unexpected behavior.
+
+**Recommendation:** Also call `verify_tofu_hash()` for `tokenizer_path` and `config_path`.
 
 ---
 
-### 2. `truncate()` panics on multi-byte UTF-8
+### NEW-4. `expire_item` re-embeds content unnecessarily and is non-atomic
 
-**Severity: MEDIUM** — **Not fixed**
+**Severity: LOW**
 
-`src/mcp/tools.rs:961-967`:
+`db.rs:743-770` — `expire_item()` reads an item, regenerates its embedding from scratch, then deletes and re-inserts it. This is:
+1. **Wasteful** — the embedding hasn't changed, only `expires_at` has
+2. **Non-atomic** — if the process crashes between delete (`db.rs:757-760`) and re-insert (`db.rs:764-768`), the item is permanently lost
+
+The same delete-then-reinsert pattern that was fixed for `replace` (store-before-delete) was not applied here.
+
+**Recommendation:** Re-insert before deleting, or find a way to avoid re-embedding.
+
+---
+
+### NEW-5. `cleanup_expired` uses unquoted integer in LanceDB filter
+
+**Severity: LOW**
+
+`db.rs:826`:
 ```rust
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len - 3])
-    }
-}
+let filter = format!("expires_at IS NOT NULL AND expires_at < {}", now);
 ```
-This slices at a byte offset. If `max_len - 3` falls in the middle of a multi-byte UTF-8 character (e.g., emoji, CJK characters), this will **panic** at runtime, crashing the MCP server.
 
-Similarly, the consolidation archive preview at `consolidation.rs:232-233` has the same issue:
+The `now` value is a system-generated `i64` (not user-controlled), so there is no injection risk. However, it breaks the pattern of sanitizing all interpolated values in LanceDB filters. If this line is ever copy-pasted with a different source value, the missing sanitization could become an issue.
+
+---
+
+### NEW-6. `graph.rs:339` silently ignores errors in `transfer_edges` internals
+
+**Severity: LOW**
+
+`graph.rs:339`:
 ```rust
-format!("{}...", &remove.content[..497])
+let _ = self.add_related_edge(to_id, neighbor, *strength, rel_type);
 ```
-If byte 497 lands mid-character, this panics.
 
-And `src/main.rs:339`:
+While consolidation callers now log errors from `transfer_edges` itself, the internal implementation still silently discards errors when creating individual new edges on the target node. If individual edge transfers fail, there's no indication of partial failure.
+
+---
+
+### NEW-7. Co-access recording creates O(n^2) edges with no pruning
+
+**Severity: MEDIUM**
+
+`graph.rs:230-248` — `record_co_access()` creates edges between every pair of result IDs. With the default limit of 5 results, this creates up to 10 edge-upserts per recall. There is no pruning or TTL for co-access edges.
+
+With heavy usage (100 recalls/day), this produces ~1000 new edge-upserts daily. The `get_co_accessed` query (`graph.rs:263-271`) scans with `OR` conditions across both `from_id` and `to_id`, which degrades as the table grows.
+
+**Recommendation:** Consider limiting co-access tracking to top-3 results, or adding periodic pruning of low-count co-access edges older than 30 days.
+
+---
+
+### NEW-8. `store` tool description says "atomically delete before storing" but behavior is store-before-delete
+
+**Severity: LOW**
+
+`tools.rs:65`:
 ```rust
-let ellipsis = if item.content.len() > 80 { "..." } else { "" };
+"description": "ID of an existing item to replace (atomically delete before storing)"
 ```
-uses `.len()` (bytes) but `.chars().take(80)` (characters) — these can disagree for non-ASCII.
+
+The actual behavior (since the safety fix) is store-before-delete (`tools.rs:462-478`). The tool schema description is now inaccurate and could mislead MCP clients about the operation semantics.
 
 ---
 
-### 3. Schema mismatch between documentation and code
+### NEW-9. `sha2` crate added but no `Cargo.lock` dependency audit
 
-**Severity: LOW** — **Not fixed**
+**Severity: LOW**
 
-The `CLAUDE.md` documents the graph_edges schema with columns `source_id, target_id, rel_type`, but the actual code in `graph.rs:59-68` uses `from_id, to_id, edge_type` with an additional `rel_type` column:
-
-- Doc: `UNIQUE(source_id, target_id, rel_type)`
-- Code: `UNIQUE(from_id, to_id, edge_type)`
-- Code has both `edge_type` AND `rel_type` columns with different semantics
+`Cargo.toml:53` adds `sha2 = "0.10"` for TOFU hashing. This is a well-known, widely-used crate, but it's a new cryptographic dependency that wasn't present in the initial version. Worth noting for dependency tracking purposes. The crate itself is trustworthy.
 
 ---
 
-### 4. Generated CLAUDE.md instructions list 4 tools, but 5 exist
+### NEW-10. `install.sh` checksum verification is optional and silently skipped
 
-**Severity: LOW** — **Not fixed**
+**Severity: LOW**
 
-`src/main.rs:354` — The `generate_claude_md_instructions()` function says "## Tools (4 total)" and lists only `store`, `recall`, `list`, and `forget` — omitting the `connections` tool.
-
----
-
-### 5. Duplicate `boost_similarity` function
-
-**Severity: LOW** — **Not fixed**
-
-`src/lib.rs:181-191` and `src/db.rs:845-851` — The `boost_similarity` function is defined identically in both files. The one in `lib.rs` is `pub` and exported; the one in `db.rs` is private. `db.rs` uses its own private copy instead of the public one.
-
----
-
-### 6. Similarity score can exceed 1.0 with trust bonus
-
-**Severity: LOW** — **Not fixed**
-
-`src/mcp/tools.rs:576`: `result.similarity = base_score * trust_bonus` where `trust_bonus >= 1.0`. Combined with the 1.15x project boost (capped at 1.0 before decay, but not after), the final similarity displayed to users can exceed 1.0.
-
----
-
-### 7. Silent error swallowing throughout graph/access operations
-
-**Severity: MEDIUM** — **Not fixed**
-
-Many graph and access operations use `let _ = ...` to silently discard errors:
-- `src/mcp/tools.rs:458` — `let _ = graph.add_node(...)`
-- `src/mcp/tools.rs:463-467` — `let _ = db.delete_item(...)`, `let _ = tracker.record_validation(...)`, `let _ = graph.add_supersedes_edge(...)`, `let _ = graph.remove_node(...)`
-- `src/mcp/tools.rs:473` — `let _ = graph.add_related_edge(...)`
-- `src/consolidation.rs:223-252` — Multiple `let _ = graph.transfer_edges(...)`, etc.
-
-If the SQLite database becomes corrupted or locked, all graph operations silently fail with no indication to the user.
-
----
-
-### 8. `timestamp_opt().unwrap()` can panic
-
-**Severity: MEDIUM** — **Not fixed**
-
-`src/db.rs:1040-1045`:
-```rust
-Utc.timestamp_opt(c.value(i), 0).unwrap()
-```
-`timestamp_opt` returns `LocalResult` which can be `None` for invalid timestamps. Corrupt or malicious database records with out-of-range timestamps will panic and crash the server.
-
----
-
-### 9. Multiple SQLite connections without consistent WAL mode
-
-**Severity: MEDIUM** — **Not fixed**
-
-`GraphStore::open()` sets `PRAGMA journal_mode=WAL` (line 50), but `AccessTracker::open()` and `ConsolidationQueue::open()` do not. The first connection to open the database determines the journal mode. If `AccessTracker` opens first, WAL is not enabled, risking `SQLITE_BUSY` errors under concurrent writes.
-
----
-
-### 10. Fire-and-forget tasks may outlive the request context
-
-**Severity: LOW** — **Not fixed**
-
-`src/mcp/tools.rs:769-773` spawns `tokio::spawn` tasks for co-access recording and clustering. These tasks may be dropped on server shutdown without completing, potentially losing co-access data.
-
----
-
-### 11. No rate limiting on tool calls
-
-**Severity: MEDIUM** — **Not fixed**
-
-The MCP server processes all requests synchronously. A misbehaving client could issue rapid-fire calls to exhaust resources.
-
----
-
-### 12. TOCTOU race in conflict detection
-
-**Severity: LOW** — **Not fixed**
-
-`store_item()` in `db.rs` searches for conflicts *before* storing. A concurrent store could insert a near-duplicate in the window between check and store.
-
----
-
-### 13. `hf-hub` downloads model without integrity verification
-
-**Severity: LOW** — **Not fixed**
-
-Model files are downloaded from HuggingFace Hub with no checksum or signature verification. A MITM or compromised HF account could serve a malicious model loaded via memory-mapped safetensors.
-
----
-
-### 14. `split_at_sentences` assumes ASCII punctuation
-
-**Severity: LOW** — **Not fixed**
-
-`src/chunker.rs` operates on bytes for sentence detection, missing non-ASCII sentence terminators.
-
----
-
-### 15. `jsonrpc-core` unused dependency
-
-**Severity: LOW** — **Not fixed**
-
-`Cargo.toml` includes `jsonrpc-core = "18"` but it's never imported. Dead weight in the dependency tree.
-
----
-
-### 16. `lib.rs` module docstring says "4 tools" (stale)
-
-**Severity: LOW** — **Not fixed**
-
-`src/lib.rs:9` says "MCP-native - 4 tools for seamless LLM integration" but there are 5 tools.
-
----
-
-### 17. No expiration cleanup mechanism
-
-**Severity: LOW** — **Worsened slightly**
-
-Expired items were already accumulating before. Now that consolidation uses soft-deletion via `expire_item()`, merged items also persist as expired records indefinitely, accelerating disk usage growth.
-
----
-
-### 18. `.sediment/config` written with default (world-readable) permissions
-
-**Severity: LOW** — **Not fixed**
-
----
-
-### 19. `find_project_root` traverses to filesystem root
-
-**Severity: LOW** — **Not fixed**
+`install.sh:52-74` — If `checksums.txt` is not available at the release URL, or if neither `sha256sum` nor `shasum` are installed, the binary is installed without any integrity verification. The script prints a warning but continues. A MITM attack during the download window would succeed if checksums.txt is not published.
 
 ---
 
 ## Summary
 
-| Severity | Count | Status |
+| Severity | Count | Issues |
 |----------|-------|--------|
-| **Critical** | 0 | All critical issues fixed |
-| **Medium** | 5 | UTF-8 panics (#2), silent errors (#7), timestamp panics (#8), WAL inconsistency (#9), no rate limiting (#11) |
-| **Low** | 14 | Various doc mismatches, unused deps, missing cleanup, residual injection gap |
+| **Critical** | 0 | None |
+| **Medium** | 2 | NaN panic in sort (#NEW-1), O(n^2) co-access growth (#NEW-7) |
+| **Low** | 8 | Rate limiter race (#NEW-2), incomplete TOFU (#NEW-3), non-atomic expire (#NEW-4), unsanitized int in filter (#NEW-5), silent transfer_edges error (#NEW-6), stale description (#NEW-8), new crypto dep (#NEW-9), optional install checksum (#NEW-10) |
 
 ### Priority Recommendations
 
-1. **Fix UTF-8 panics (#2)** — Use `s.char_indices()` or `s.floor_char_boundary()` instead of byte slicing in `truncate()` and the consolidation archive. This is the most likely remaining crash vector.
-2. **Fix `timestamp_opt().unwrap()` (#8)** — Replace with `.single()` or provide a fallback to prevent panics on corrupt data.
-3. **Set WAL mode consistently (#9)** — Add `PRAGMA journal_mode=WAL` to `AccessTracker::open()` and `ConsolidationQueue::open()`.
-4. **Sanitize the missed `expire_item` call (#1)** — Apply `sanitize_sql_string` to `db.rs:754` for consistency.
-5. **Update stale documentation (#3, #4, #16)** — Fix tool counts and schema docs.
+1. **Fix `partial_cmp().unwrap()` (#NEW-1)** — This is the highest-risk remaining crash vector. Replace with `.unwrap_or(std::cmp::Ordering::Equal)` or `f32::total_cmp()` at all three sites.
+2. **Add TOFU verification for tokenizer and config (#NEW-3)** — Two additional `verify_tofu_hash()` calls in `embedder.rs`.
+3. **Fix store tool description (#NEW-8)** — Change "atomically delete before storing" to "atomically replace (store then delete old)".
+4. **Consider co-access pruning (#NEW-7)** — Add periodic cleanup of co-access edges with count < 2 and age > 30 days.
