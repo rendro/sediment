@@ -402,8 +402,7 @@ async fn execute_store(
         if meta_size > MAX_METADATA_BYTES {
             return CallToolResult::error(format!(
                 "Metadata too large: {} bytes (max {})",
-                meta_size,
-                MAX_METADATA_BYTES
+                meta_size, MAX_METADATA_BYTES
             ));
         }
     }

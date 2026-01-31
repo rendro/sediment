@@ -1373,7 +1373,10 @@ mod tests {
         // which is what our fix relies on via ok_or_else
         let arr = Int32Array::from(vec![1, 2, 3]);
         let result = arr.as_any().downcast_ref::<StringArray>();
-        assert!(result.is_none(), "downcast_ref should return None for wrong type");
+        assert!(
+            result.is_none(),
+            "downcast_ref should return None for wrong type"
+        );
     }
 
     #[test]

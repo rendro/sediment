@@ -286,12 +286,9 @@ async fn process_candidate(
                 // Create a RELATED edge marking this as a merge archive.
                 // Content is NOT stored in the edge label — it can be recovered
                 // via the SUPERSEDES edge and the soft-deleted item.
-                if let Err(e) = graph.add_related_edge(
-                    &keep.id,
-                    &remove.id,
-                    fresh_similarity,
-                    "merged_archive",
-                ) {
+                if let Err(e) =
+                    graph.add_related_edge(&keep.id, &remove.id, fresh_similarity, "merged_archive")
+                {
                     tracing::warn!("add_related_edge failed: {}", e);
                 }
 
@@ -393,7 +390,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(has_index, "consolidation_queue should have an index on status");
+        assert!(
+            has_index,
+            "consolidation_queue should have an index on status"
+        );
     }
 
     #[test]
