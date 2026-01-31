@@ -218,12 +218,38 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
         .get("config.json")
         .map_err(|e| SedimentError::ModelLoading(format!("Failed to download config: {}", e)))?;
 
-    // Integrity is ensured by the pinned git revision above.
-    // TOFU sidecar hashes were removed as they provide no additional security:
-    // both the model and hash files share the same directory permissions,
-    // so an attacker who can modify one can modify the other.
+    // Verify model integrity using hardcoded SHA-256 hash.
+    // This protects against cache poisoning where an attacker modifies files
+    // in ~/.cache/huggingface/ after download. The hash is a compile-time
+    // constant tied to the pinned git revision above.
+    verify_model_hash(&model_path)?;
 
     Ok((model_path, tokenizer_path, config_path))
+}
+
+/// Expected SHA-256 hash of model.safetensors for the pinned revision.
+const MODEL_SHA256: &str = "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db";
+
+/// Verify the SHA-256 hash of the model file against the expected value.
+fn verify_model_hash(path: &std::path::Path) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let file_bytes = std::fs::read(path).map_err(|e| {
+        SedimentError::ModelLoading(format!("Failed to read model for hash verification: {}", e))
+    })?;
+
+    let hash = Sha256::digest(&file_bytes);
+    let hex_hash = format!("{:x}", hash);
+
+    if hex_hash != MODEL_SHA256 {
+        return Err(SedimentError::ModelLoading(format!(
+            "Model integrity check failed: expected SHA-256 {}, got {}",
+            MODEL_SHA256, hex_hash
+        )));
+    }
+
+    info!("Model integrity verified (SHA-256)");
+    Ok(())
 }
 
 /// L2 normalize a tensor

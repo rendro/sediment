@@ -288,7 +288,7 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
                 "store" => execute_store(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
                 "recall" => execute_recall(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
                 "list" => execute_list(&mut db, args_clone).await,
-                "forget" => execute_forget(&mut db, &graph, args_clone).await,
+                "forget" => execute_forget(&mut db, &graph, ctx_ref, args_clone).await,
                 "connections" => execute_connections(&mut db, &graph, args_clone).await,
                 _ => return Ok(CallToolResult::error(format!("Unknown tool: {}", name_ref))),
             };
@@ -346,7 +346,9 @@ async fn execute_store(
         None => return CallToolResult::error("Missing parameters"),
     };
 
-    // Reject oversized content to prevent OOM during embedding/chunking (1MB limit)
+    // Reject oversized content to prevent OOM during embedding/chunking.
+    // Intentionally byte-based (not char-based): memory allocation is proportional
+    // to byte length, so this is the correct metric for OOM prevention.
     const MAX_CONTENT_BYTES: usize = 1_000_000;
     if params.content.len() > MAX_CONTENT_BYTES {
         return CallToolResult::error(format!(
@@ -378,10 +380,23 @@ async fn execute_store(
         None
     };
 
-    // Validate that the item to replace exists (actual deletion deferred until after store)
+    // Validate that the item to replace exists and belongs to the current project
     let replaced_id = if let Some(ref replace_id) = params.replace {
         match db.get_item(replace_id).await {
-            Ok(Some(_)) => Some(replace_id.clone()),
+            Ok(Some(item)) => {
+                // Access control: prevent replacing items from other projects
+                if let Some(ref current_pid) = ctx.project_id {
+                    if let Some(ref item_pid) = item.project_id {
+                        if item_pid != current_pid {
+                            return CallToolResult::error(format!(
+                                "Cannot replace item {} from a different project",
+                                replace_id
+                            ));
+                        }
+                    }
+                }
+                Some(replace_id.clone())
+            }
             Ok(None) => {
                 return CallToolResult::error(format!(
                     "Cannot replace: item not found: {}",
@@ -472,8 +487,10 @@ async fn execute_store(
                 tracing::warn!("graph add_node failed: {}", e);
             }
 
-            // Complete replace: now that the new item is stored, delete the old one
-            // (store-before-delete ensures no data loss on crash)
+            // Complete replace: now that the new item is stored, delete the old one.
+            // Intentionally non-atomic (store-before-delete): if the process crashes
+            // between store and delete, both items exist (benign duplication, not data
+            // loss). The consolidation system will detect and merge duplicates.
             if let Some(ref old_id) = replaced_id {
                 // Record validation on the NEW item (the replacement is a "confirmed" version)
                 let now_ts = chrono::Utc::now().timestamp();
@@ -1005,6 +1022,7 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
 async fn execute_forget(
     db: &mut Database,
     graph: &GraphStore,
+    ctx: &ServerContext,
     args: Option<Value>,
 ) -> CallToolResult {
     let params: ForgetParams = match args {
@@ -1014,6 +1032,26 @@ async fn execute_forget(
         },
         None => return CallToolResult::error("Missing parameters"),
     };
+
+    // Access control: verify the item belongs to the current project (or is global)
+    if let Some(ref current_pid) = ctx.project_id {
+        match db.get_item(&params.id).await {
+            Ok(Some(item)) => {
+                if let Some(ref item_pid) = item.project_id {
+                    if item_pid != current_pid {
+                        return CallToolResult::error(format!(
+                            "Cannot delete item {} from a different project",
+                            params.id
+                        ));
+                    }
+                }
+            }
+            Ok(None) => return CallToolResult::error(format!("Item not found: {}", params.id)),
+            Err(e) => {
+                return CallToolResult::error(format!("Failed to look up item: {}", e));
+            }
+        }
+    }
 
     match db.delete_item(&params.id).await {
         Ok(true) => {
