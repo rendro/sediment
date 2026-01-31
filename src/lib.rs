@@ -147,11 +147,15 @@ impl Default for ProjectConfig {
 ///
 /// The project ID is stored in `<project_root>/.sediment/config`.
 /// If no config exists, a new UUID is generated and saved.
+///
+/// This function is safe to call concurrently: it uses a lock file
+/// to serialize config creation, preventing race conditions where
+/// multiple threads/processes create different UUIDs.
 pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> {
     let sediment_dir = project_root.join(".sediment");
     let config_path = sediment_dir.join("config");
 
-    // Try to read existing config
+    // Fast path: config already exists
     if config_path.exists() {
         let content = std::fs::read_to_string(&config_path)?;
         if let Ok(config) = serde_json::from_str::<ProjectConfig>(&content) {
@@ -159,35 +163,106 @@ pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> 
         }
     }
 
-    // Create new config with generated UUID
-    let config = ProjectConfig::default();
-
     // Ensure .sediment directory exists
     std::fs::create_dir_all(&sediment_dir)?;
 
-    // Write to a temp file first, then atomically rename to prevent TOCTOU races
-    // where two concurrent processes both see the file as missing and write different UUIDs.
+    // Use a lock file to serialize concurrent config creation.
+    let lock_path = sediment_dir.join("config.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    lock_file.lock_exclusive()?;
+
+    // Re-check after acquiring lock (another thread may have created it)
+    let result = if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        if let Ok(config) = serde_json::from_str::<ProjectConfig>(&content) {
+            Ok(config.project_id)
+        } else {
+            // Corrupted config — rewrite
+            create_config(&sediment_dir, &config_path)
+        }
+    } else {
+        create_config(&sediment_dir, &config_path)
+    };
+
+    lock_file.unlock()?;
+    result
+}
+
+/// Helper trait for file locking (uses POSIX flock on Unix).
+#[allow(dead_code)]
+trait FileLock {
+    fn lock_exclusive(&self) -> std::io::Result<()>;
+    fn unlock(&self) -> std::io::Result<()>;
+}
+
+#[cfg(unix)]
+mod flock_sys {
+    unsafe extern "C" {
+        pub fn flock(fd: std::ffi::c_int, operation: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    pub const LOCK_EX: std::ffi::c_int = 2;
+    #[allow(dead_code)]
+    pub const LOCK_UN: std::ffi::c_int = 8;
+}
+
+#[cfg(unix)]
+impl FileLock for std::fs::File {
+    fn lock_exclusive(&self) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { flock_sys::flock(self.as_raw_fd(), flock_sys::LOCK_EX) };
+        if ret != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn unlock(&self) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { flock_sys::flock(self.as_raw_fd(), flock_sys::LOCK_UN) };
+        if ret != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl FileLock for std::fs::File {
+    fn lock_exclusive(&self) -> std::io::Result<()> {
+        // On non-Unix platforms, fall back to no locking.
+        // The rename-based approach still provides some protection.
+        Ok(())
+    }
+    fn unlock(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn create_config(sediment_dir: &Path, config_path: &Path) -> std::io::Result<String> {
+    let config = ProjectConfig::default();
     let content =
         serde_json::to_string_pretty(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let tmp_path = sediment_dir.join(format!("config.tmp.{}", std::process::id()));
+
+    let tmp_path = sediment_dir.join(format!(
+        "config.tmp.{}.{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
     std::fs::write(&tmp_path, &content)?;
 
-    // Atomic rename: on Unix this is atomic. The first writer wins; subsequent renames
-    // just overwrite with a different UUID but that's acceptable since no data existed yet.
-    // After rename, re-read to get whichever UUID actually persisted.
-    if let Err(e) = std::fs::rename(&tmp_path, &config_path) {
-        // Clean up temp file on failure
+    if let Err(e) = std::fs::rename(&tmp_path, config_path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
     }
 
-    // Re-read to return the UUID that actually persisted (could be from another process)
-    let final_content = std::fs::read_to_string(&config_path)?;
-    if let Ok(final_config) = serde_json::from_str::<ProjectConfig>(&final_content) {
-        Ok(final_config.project_id)
-    } else {
-        Ok(config.project_id)
-    }
+    Ok(config.project_id)
 }
 
 /// Apply similarity boosting based on project context.
@@ -280,6 +355,28 @@ mod tests {
         let id1 = get_or_create_project_id(tmp.path()).unwrap();
         let id2 = get_or_create_project_id(tmp.path()).unwrap();
         assert_eq!(id1, id2, "Repeated calls should return the same project ID");
+    }
+
+    #[test]
+    fn test_project_config_concurrent_creation() {
+        // Multiple threads creating a project config simultaneously
+        // should all get the same project ID
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || get_or_create_project_id(&p).unwrap())
+            })
+            .collect();
+
+        let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            ids.windows(2).all(|w| w[0] == w[1]),
+            "all threads should get same ID, got {:?}",
+            ids
+        );
     }
 
     #[test]

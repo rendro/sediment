@@ -485,7 +485,10 @@ async fn execute_store(
         item = item.with_project_id(project_id);
     }
 
-    // Auto-tag inference (Phase 4a): if no user tags, infer from similar items
+    // Auto-tag inference (Phase 4a): if no user tags, infer from similar items.
+    // Note: this runs BEFORE store_item, so concurrent stores may see slightly
+    // different similar-item sets than the conflict detection inside store_item.
+    // This race is benign — auto-tags are best-effort advisory labels.
     if tags.is_empty()
         && let Ok(similar) = db.find_similar_items(&params.content, 0.85, 5).await
     {
