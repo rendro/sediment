@@ -1441,7 +1441,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_sql_string_strips_semicolons() {
-        assert_eq!(sanitize_sql_string("a; DROP TABLE items"), "a DROP TABLE items");
+        assert_eq!(
+            sanitize_sql_string("a; DROP TABLE items"),
+            "a DROP TABLE items"
+        );
         assert_eq!(sanitize_sql_string("normal;"), "normal");
     }
 
@@ -1458,9 +1461,15 @@ mod tests {
     #[test]
     fn test_sanitize_sql_string_adversarial_inputs() {
         // Classic SQL injection
-        assert_eq!(sanitize_sql_string("'; DROP TABLE items;--"), "'' DROP TABLE items");
+        assert_eq!(
+            sanitize_sql_string("'; DROP TABLE items;--"),
+            "'' DROP TABLE items"
+        );
         // Unicode escapes (should pass through harmlessly)
-        assert_eq!(sanitize_sql_string("hello\u{200B}world"), "hello\u{200B}world");
+        assert_eq!(
+            sanitize_sql_string("hello\u{200B}world"),
+            "hello\u{200B}world"
+        );
         // Empty string
         assert_eq!(sanitize_sql_string(""), "");
         // Only special chars

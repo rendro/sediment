@@ -371,24 +371,24 @@ async fn execute_store(
     const MAX_TAG_COUNT: usize = 50;
     const MAX_METADATA_BYTES: usize = 100_000;
 
-    if let Some(ref title) = params.title {
-        if title.len() > MAX_TITLE_LEN {
-            return CallToolResult::error(format!(
-                "Title too large: {} bytes (max {})",
-                title.len(),
-                MAX_TITLE_LEN
-            ));
-        }
+    if let Some(ref title) = params.title
+        && title.len() > MAX_TITLE_LEN
+    {
+        return CallToolResult::error(format!(
+            "Title too large: {} bytes (max {})",
+            title.len(),
+            MAX_TITLE_LEN
+        ));
     }
 
-    if let Some(ref source) = params.source {
-        if source.len() > MAX_SOURCE_LEN {
-            return CallToolResult::error(format!(
-                "Source too large: {} bytes (max {})",
-                source.len(),
-                MAX_SOURCE_LEN
-            ));
-        }
+    if let Some(ref source) = params.source
+        && source.len() > MAX_SOURCE_LEN
+    {
+        return CallToolResult::error(format!(
+            "Source too large: {} bytes (max {})",
+            source.len(),
+            MAX_SOURCE_LEN
+        ));
     }
 
     if let Some(ref tags) = params.tags {
@@ -415,8 +415,7 @@ async fn execute_store(
         if meta_size > MAX_METADATA_BYTES {
             return CallToolResult::error(format!(
                 "Metadata too large: {} bytes (max {})",
-                meta_size,
-                MAX_METADATA_BYTES
+                meta_size, MAX_METADATA_BYTES
             ));
         }
     }
@@ -448,15 +447,14 @@ async fn execute_store(
         match db.get_item(replace_id).await {
             Ok(Some(item)) => {
                 // Access control: prevent replacing items from other projects
-                if let Some(ref current_pid) = ctx.project_id {
-                    if let Some(ref item_pid) = item.project_id {
-                        if item_pid != current_pid {
-                            return CallToolResult::error(format!(
-                                "Cannot replace item {} from a different project",
-                                replace_id
-                            ));
-                        }
-                    }
+                if let Some(ref current_pid) = ctx.project_id
+                    && let Some(ref item_pid) = item.project_id
+                    && item_pid != current_pid
+                {
+                    return CallToolResult::error(format!(
+                        "Cannot replace item {} from a different project",
+                        replace_id
+                    ));
                 }
                 Some(replace_id.clone())
             }
@@ -1129,13 +1127,13 @@ async fn execute_forget(
     if let Some(ref current_pid) = ctx.project_id {
         match db.get_item(&params.id).await {
             Ok(Some(item)) => {
-                if let Some(ref item_pid) = item.project_id {
-                    if item_pid != current_pid {
-                        return CallToolResult::error(format!(
-                            "Cannot delete item {} from a different project",
-                            params.id
-                        ));
-                    }
+                if let Some(ref item_pid) = item.project_id
+                    && item_pid != current_pid
+                {
+                    return CallToolResult::error(format!(
+                        "Cannot delete item {} from a different project",
+                        params.id
+                    ));
                 }
             }
             Ok(None) => return CallToolResult::error(format!("Item not found: {}", params.id)),
@@ -1186,15 +1184,14 @@ async fn execute_connections(
     // Verify item exists and belongs to the current project
     match db.get_item(&params.id).await {
         Ok(Some(item)) => {
-            if let Some(ref current_pid) = ctx.project_id {
-                if let Some(ref item_pid) = item.project_id {
-                    if item_pid != current_pid {
-                        return CallToolResult::error(format!(
-                            "Cannot view connections for item {} from a different project",
-                            params.id
-                        ));
-                    }
-                }
+            if let Some(ref current_pid) = ctx.project_id
+                && let Some(ref item_pid) = item.project_id
+                && item_pid != current_pid
+            {
+                return CallToolResult::error(format!(
+                    "Cannot view connections for item {} from a different project",
+                    params.id
+                ));
             }
         }
         Ok(None) => return CallToolResult::error(format!("Item not found: {}", params.id)),

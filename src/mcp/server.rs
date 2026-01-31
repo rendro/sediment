@@ -128,11 +128,7 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
                         }
                     }
                 }
-                let response = Response::error(
-                    None,
-                    INVALID_REQUEST,
-                    "Request too large",
-                );
+                let response = Response::error(None, INVALID_REQUEST, "Request too large");
                 let response_json = serde_json::to_string(&response)?;
                 writeln!(stdout, "{}", response_json)?;
                 stdout.flush()?;
@@ -143,9 +139,14 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
                 continue;
             }
 
-            tracing::debug!("Received: ({} bytes) {}",
+            tracing::debug!(
+                "Received: ({} bytes) {}",
                 line.len(),
-                if line.len() > 200 { &line[..200] } else { &line }
+                if line.len() > 200 {
+                    &line[..200]
+                } else {
+                    &line
+                }
             );
 
             // Handle request and get optional response (notifications don't get responses)
@@ -241,7 +242,10 @@ fn handle_initialize(id: Option<Value>) -> Response {
     };
 
     // InitializeResult is a simple struct; serialization is infallible.
-    Response::success(id, serde_json::to_value(result).expect("InitializeResult serialization"))
+    Response::success(
+        id,
+        serde_json::to_value(result).expect("InitializeResult serialization"),
+    )
 }
 
 /// Handle tools/list request
@@ -249,7 +253,10 @@ fn handle_list_tools(id: Option<Value>) -> Response {
     let result = ListToolsResult { tools: get_tools() };
 
     // ListToolsResult is a simple struct; serialization is infallible.
-    Response::success(id, serde_json::to_value(result).expect("ListToolsResult serialization"))
+    Response::success(
+        id,
+        serde_json::to_value(result).expect("ListToolsResult serialization"),
+    )
 }
 
 /// Handle tools/call request
@@ -294,7 +301,10 @@ fn handle_call_tool(
             let result =
                 super::protocol::CallToolResult::error("Rate limit exceeded, try again later");
             // CallToolResult is a simple struct; serialization is infallible.
-            return Response::success(id, serde_json::to_value(result).expect("CallToolResult serialization"));
+            return Response::success(
+                id,
+                serde_json::to_value(result).expect("CallToolResult serialization"),
+            );
         }
     }
 
@@ -302,7 +312,10 @@ fn handle_call_tool(
     let result = rt.block_on(execute_tool(ctx, &params.name, params.arguments));
 
     // CallToolResult is a simple struct; serialization is infallible.
-    Response::success(id, serde_json::to_value(result).expect("CallToolResult serialization"))
+    Response::success(
+        id,
+        serde_json::to_value(result).expect("CallToolResult serialization"),
+    )
 }
 
 /// Handle ping request
