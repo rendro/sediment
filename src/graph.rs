@@ -318,6 +318,10 @@ impl GraphStore {
             results.push(r);
         }
 
+        // Filter out input IDs (same as get_neighbors) then deduplicate
+        let input_set: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        results.retain(|(id, _)| !input_set.contains(id.as_str()));
+
         // Deduplicate by target_id, keeping highest count
         results.sort_by(|a, b| b.1.cmp(&a.1));
         let mut seen = std::collections::HashSet::new();
@@ -549,6 +553,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(edge_count, 2, "Edge count should be 2 (incremented twice)");
+    }
+
+    #[test]
+    fn test_get_co_accessed_excludes_input_ids() {
+        let tmp = NamedTempFile::new().unwrap();
+        let graph = GraphStore::open(tmp.path()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        graph.add_node("A", Some("proj"), now).unwrap();
+        graph.add_node("B", Some("proj"), now).unwrap();
+        graph.add_node("C", Some("proj"), now).unwrap();
+
+        for _ in 0..4 {
+            graph
+                .record_co_access(&["A".to_string(), "B".to_string()])
+                .unwrap();
+            graph
+                .record_co_access(&["A".to_string(), "C".to_string()])
+                .unwrap();
+        }
+
+        let results = graph.get_co_accessed(&["A"], 1).unwrap();
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            !ids.contains(&"A"),
+            "get_co_accessed must not return input IDs; got {:?}",
+            ids
+        );
+        assert!(ids.contains(&"B"));
+        assert!(ids.contains(&"C"));
     }
 
     #[test]

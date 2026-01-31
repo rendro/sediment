@@ -50,6 +50,13 @@ impl ConsolidationQueue {
             SedimentError::Database(format!("Failed to create consolidation_queue table: {}", e))
         })?;
 
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_consolidation_status ON consolidation_queue(status);",
+        )
+        .map_err(|e| {
+            SedimentError::Database(format!("Failed to create consolidation index: {}", e))
+        })?;
+
         Ok(Self { conn })
     }
 
@@ -370,6 +377,21 @@ mod tests {
         let remaining = queue.fetch_pending(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].item_id_a, "c");
+    }
+
+    #[test]
+    fn test_consolidation_queue_has_status_index() {
+        let tmp = NamedTempFile::new().unwrap();
+        let q = ConsolidationQueue::open(tmp.path()).unwrap();
+        let has_index: bool = q
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND sql LIKE '%status%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_index, "consolidation_queue should have an index on status");
     }
 
     #[test]

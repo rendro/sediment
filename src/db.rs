@@ -938,7 +938,7 @@ impl Database {
 /// Compute a decay-adjusted score for a search result.
 ///
 /// Formula: `similarity * freshness * frequency`
-/// - freshness = 1.0 / (1.0 + age_days / 30.0)  (half-life ~30 days)
+/// - freshness = 1.0 / (1.0 + age_days / 30.0)  (hyperbolic decay, reaches 0.5 at 30 days)
 /// - frequency = 1.0 + 0.1 * ln(1 + access_count)
 ///
 /// `last_accessed_at` and `created_at` are unix timestamps.
@@ -1281,7 +1281,7 @@ fn batch_to_chunks(batch: &RecordBatch) -> Result<Vec<Chunk>> {
     for i in 0..batch.num_rows() {
         let id = id_col.value(i).to_string();
         let item_id = item_id_col.value(i).to_string();
-        let chunk_index = chunk_index_col.value(i) as usize;
+        let chunk_index = usize::try_from(chunk_index_col.value(i)).unwrap_or(0);
         let content = content_col.value(i).to_string();
         let context = context_col.and_then(|c| {
             if c.is_null(i) {
@@ -1358,6 +1358,38 @@ mod tests {
         // freshness = 1/(1+3) = 0.25
         let expected = 0.8 * 0.25;
         assert!((score - expected).abs() < 0.001, "got {}", score);
+    }
+
+    #[test]
+    fn test_decay_formula_is_hyperbolic_not_exponential() {
+        let now = 1700000000i64;
+        // At 30 days: hyperbolic gives 0.5, exponential would give 0.5 — same
+        let created_30 = now - 30 * 86400;
+        let score_30 = score_with_decay(1.0, now, created_30, 0, None);
+        assert!(
+            (score_30 - 0.5).abs() < 0.01,
+            "30-day score should be ~0.5, got {}",
+            score_30
+        );
+
+        // At 60 days: hyperbolic gives 1/(1+2)=0.333, exponential would give 0.25
+        let created_60 = now - 60 * 86400;
+        let score_60 = score_with_decay(1.0, now, created_60, 0, None);
+        assert!(
+            (score_60 - 0.333).abs() < 0.01,
+            "60-day score should be ~0.333 (hyperbolic), got {}",
+            score_60
+        );
+    }
+
+    #[test]
+    fn test_chunk_index_negative_cast_is_safe() {
+        // Negative i32 should not silently wrap to huge usize
+        let negative: i32 = -1;
+        let result = usize::try_from(negative);
+        assert!(result.is_err(), "negative i32 should not convert to usize");
+        // Our fix uses unwrap_or(0), so -1 becomes 0
+        assert_eq!(usize::try_from(negative).unwrap_or(0), 0);
     }
 
     #[test]
