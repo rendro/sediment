@@ -797,7 +797,7 @@ impl Database {
     /// re-insert fails, retries up to 3 times to avoid data loss.
     pub async fn expire_item(&self, id: &str, expires_at: chrono::DateTime<Utc>) -> Result<()> {
         if !is_valid_id(id) {
-            return Err(SedimentError::Database(format!("Invalid item ID")));
+            return Err(SedimentError::Database("Invalid item ID".to_string()));
         }
         let table = match &self.items_table {
             Some(t) => t,
