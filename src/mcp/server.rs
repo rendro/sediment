@@ -39,6 +39,10 @@ pub struct ServerContext {
     pub cwd: PathBuf,
     /// Semaphore to ensure only one consolidation task runs at a time
     pub consolidation_semaphore: Arc<Semaphore>,
+    /// Semaphore to ensure only one clustering task runs at a time
+    pub clustering_semaphore: Arc<Semaphore>,
+    /// Semaphore to ensure only one cleanup task runs at a time
+    pub cleanup_semaphore: Arc<Semaphore>,
     /// Counter for recall invocations (triggers periodic clustering and expired cleanup)
     pub recall_count: std::sync::atomic::AtomicU64,
     /// Rate limiter state (mutex protects window+count as a unit)
@@ -70,6 +74,8 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
         embedder,
         cwd,
         consolidation_semaphore: Arc::new(Semaphore::new(1)),
+        clustering_semaphore: Arc::new(Semaphore::new(1)),
+        cleanup_semaphore: Arc::new(Semaphore::new(1)),
         recall_count: std::sync::atomic::AtomicU64::new(0),
         rate_limit: Mutex::new(RateLimitState {
             window_start_ms: 0,

@@ -207,8 +207,11 @@ pub struct SearchResult {
     /// Most relevant chunk content (if chunked)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relevant_excerpt: Option<String>,
-    /// Similarity score (0.0-1.0, higher is more similar)
+    /// Composite score (similarity * freshness * frequency * trust_bonus, capped at 1.0)
     pub similarity: f32,
+    /// Raw cosine similarity before decay/trust adjustments (None if no adjustments applied)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_similarity: Option<f32>,
     /// Tags
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -233,6 +236,7 @@ impl SearchResult {
             content: item.content.clone(),
             relevant_excerpt: None,
             similarity,
+            raw_similarity: None,
             tags: item.tags.clone(),
             source: item.source.clone(),
             created_at: item.created_at,
@@ -252,6 +256,7 @@ impl SearchResult {
             content,
             relevant_excerpt: Some(excerpt),
             similarity,
+            raw_similarity: None,
             tags: item.tags.clone(),
             source: item.source.clone(),
             created_at: item.created_at,

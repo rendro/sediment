@@ -241,31 +241,30 @@ async fn process_candidate(
 ) -> Result<String> {
     let graph = crate::graph::GraphStore::open(graph_db_path)?;
 
+    // Fetch items once and reuse for both similarity check and merge/link logic.
+    // This eliminates the double-fetch consistency issue where items could change
+    // between the similarity check and the merge operation.
+    let item_a = db.get_item(&candidate.item_id_a).await?;
+    let item_b = db.get_item(&candidate.item_id_b).await?;
+
     // Recompute similarity using current embeddings (the stored score may be stale
     // if items were modified via replace since enqueue time).
-    let fresh_similarity = {
-        let item_a = db.get_item(&candidate.item_id_a).await?;
-        let item_b = db.get_item(&candidate.item_id_b).await?;
-        match (item_a.as_ref(), item_b.as_ref()) {
-            (Some(a), Some(b)) if !a.embedding.is_empty() && !b.embedding.is_empty() => {
-                // Cosine similarity (embeddings are L2-normalized, so dot product = cosine sim)
-                let dot: f32 = a
-                    .embedding
-                    .iter()
-                    .zip(b.embedding.iter())
-                    .map(|(x, y)| x * y)
-                    .sum();
-                dot as f64
-            }
-            _ => candidate.similarity, // fallback to stored score if items missing/no embeddings
+    let fresh_similarity = match (item_a.as_ref(), item_b.as_ref()) {
+        (Some(a), Some(b)) if !a.embedding.is_empty() && !b.embedding.is_empty() => {
+            // Cosine similarity (embeddings are L2-normalized, so dot product = cosine sim)
+            let dot: f32 = a
+                .embedding
+                .iter()
+                .zip(b.embedding.iter())
+                .map(|(x, y)| x * y)
+                .sum();
+            dot as f64
         }
+        _ => candidate.similarity, // fallback to stored score if items missing/no embeddings
     };
 
     if fresh_similarity >= 0.95 {
         // Near-duplicate: newer absorbs older (non-destructive — archive removed content)
-        let item_a = db.get_item(&candidate.item_id_a).await?;
-        let item_b = db.get_item(&candidate.item_id_b).await?;
-
         match (item_a, item_b) {
             (Some(a), Some(b)) => {
                 let (keep, remove) = if a.created_at >= b.created_at {

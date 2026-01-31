@@ -650,6 +650,9 @@ pub async fn recall_pipeline(
                 None => (0, None),
             };
 
+            // Preserve raw cosine similarity before decay/trust adjustments
+            result.raw_similarity = Some(result.similarity);
+
             let base_score = score_with_decay(
                 result.similarity,
                 now,
@@ -811,6 +814,9 @@ async fn execute_recall(
                 "created": r.created_at.to_rfc3339(),
             });
 
+            if let Some(raw) = r.raw_similarity {
+                obj["raw_similarity"] = json!(format!("{:.2}", raw));
+            }
             if let Some(ref excerpt) = r.relevant_excerpt {
                 obj["relevant_excerpt"] = json!(excerpt);
             }
@@ -887,9 +893,17 @@ async fn execute_recall(
         .recall_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if run_count % 10 == 9 {
-        // Clustering
+        // Clustering (guarded by semaphore to prevent overlapping runs)
         let access_db_path = ctx.access_db_path.clone();
+        let clustering_semaphore = ctx.clustering_semaphore.clone();
         spawn_logged("clustering", async move {
+            let _permit = match clustering_semaphore.try_acquire() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::debug!("Clustering already running, skipping");
+                    return;
+                }
+            };
             if let Ok(g) = GraphStore::open(&access_db_path)
                 && let Ok(clusters) = g.detect_clusters()
             {
@@ -911,11 +925,19 @@ async fn execute_recall(
             }
         });
 
-        // Expired item cleanup
+        // Expired item cleanup (guarded by semaphore to prevent overlapping runs)
         let db_path = ctx.db_path.clone();
         let project_id = ctx.project_id.clone();
         let embedder = ctx.embedder.clone();
+        let cleanup_semaphore = ctx.cleanup_semaphore.clone();
         spawn_logged("cleanup_expired", async move {
+            let _permit = match cleanup_semaphore.try_acquire() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::debug!("Cleanup already running, skipping");
+                    return;
+                }
+            };
             match Database::open_with_embedder(&db_path, project_id, embedder).await {
                 Ok(db) => {
                     if let Err(e) = db.cleanup_expired().await {
