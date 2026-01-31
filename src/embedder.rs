@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
+use sha2::{Digest, Sha256};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 use tracing::info;
 
@@ -194,7 +195,11 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
         .build()
         .map_err(|e| SedimentError::ModelLoading(format!("Failed to create HF API: {}", e)))?;
 
-    let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
+    let repo = api.repo(Repo::with_revision(
+        model_id.to_string(),
+        RepoType::Model,
+        "e4ce9877abf3edfe10b0d82785e83bdcb973e22e".to_string(),
+    ));
 
     let model_path = repo
         .get("model.safetensors")
@@ -208,7 +213,47 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
         .get("config.json")
         .map_err(|e| SedimentError::ModelLoading(format!("Failed to download config: {}", e)))?;
 
+    // TOFU: verify model integrity
+    verify_tofu_hash(&model_path, "model.safetensors")?;
+
     Ok((model_path, tokenizer_path, config_path))
+}
+
+/// Compute SHA256 hash of a file.
+fn sha256_file(path: &Path) -> Result<String> {
+    let data = std::fs::read(path)
+        .map_err(|e| SedimentError::ModelLoading(format!("Failed to read file for hash: {}", e)))?;
+    let hash = Sha256::digest(&data);
+    Ok(format!("{:x}", hash))
+}
+
+/// Trust-on-first-use hash verification for model files.
+///
+/// On first download, stores the SHA256 hash in a `.sha256` sidecar file next to the model.
+/// On subsequent loads, verifies the file still matches the stored hash.
+fn verify_tofu_hash(file_path: &Path, label: &str) -> Result<()> {
+    let hash_path = file_path.with_extension("sha256");
+    let current_hash = sha256_file(file_path)?;
+
+    if hash_path.exists() {
+        let stored_hash = std::fs::read_to_string(&hash_path)
+            .map_err(|e| SedimentError::ModelLoading(format!("Failed to read hash file: {}", e)))?;
+        let stored_hash = stored_hash.trim();
+        if stored_hash != current_hash {
+            return Err(SedimentError::ModelLoading(format!(
+                "TOFU integrity check failed for {}: expected {}, got {}",
+                label, stored_hash, current_hash
+            )));
+        }
+        info!("TOFU hash verified for {}", label);
+    } else {
+        std::fs::write(&hash_path, &current_hash).map_err(|e| {
+            SedimentError::ModelLoading(format!("Failed to write hash file: {}", e))
+        })?;
+        info!("TOFU hash recorded for {}: {}", label, current_hash);
+    }
+
+    Ok(())
 }
 
 /// L2 normalize a tensor

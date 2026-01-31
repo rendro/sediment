@@ -38,10 +38,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Async
-tokio = { version = "1", features = ["full"] }
-
-# MCP
-jsonrpc-core = "18"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -53,6 +50,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # Utils
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"

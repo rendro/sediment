@@ -113,13 +113,15 @@ CREATE TABLE graph_nodes (
 
 -- Graph edges (RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING)
 CREATE TABLE graph_edges (
-    source_id TEXT, target_id TEXT,
-    rel_type TEXT,        -- 'related', 'supersedes', 'co_accessed', 'cluster_sibling'
-    strength REAL,
-    count INTEGER,
-    label TEXT,
-    created_at INTEGER,
-    UNIQUE(source_id, target_id, rel_type)
+    from_id TEXT NOT NULL,
+    to_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,     -- 'related', 'supersedes', 'co_accessed', 'cluster_sibling'
+    strength REAL NOT NULL DEFAULT 0.0,
+    rel_type TEXT NOT NULL DEFAULT '',
+    count INTEGER NOT NULL DEFAULT 0,
+    last_at INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    UNIQUE(from_id, to_id, edge_type)
 );
 
 -- Access tracking and decay scoring

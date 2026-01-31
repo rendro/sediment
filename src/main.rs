@@ -336,7 +336,11 @@ fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
                 .take(80)
                 .collect::<String>()
                 .replace('\n', " ");
-            let ellipsis = if item.content.len() > 80 { "..." } else { "" };
+            let ellipsis = if item.content.chars().count() > 80 {
+                "..."
+            } else {
+                ""
+            };
             println!("    Content: {}{}", content_preview, ellipsis);
             println!();
         }
@@ -351,12 +355,13 @@ fn generate_claude_md_instructions() -> String {
 
 Use the Sediment MCP tools for persistent memory storage.
 
-## Tools (4 total)
+## Tools (5 total)
 
 - `mcp__sediment__store` - Store content for later retrieval
 - `mcp__sediment__recall` - Search by semantic similarity
 - `mcp__sediment__list` - List stored items
 - `mcp__sediment__forget` - Delete an item by ID
+- `mcp__sediment__connections` - Show relationship graph for an item
 
 ## When to Store
 

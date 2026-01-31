@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 
@@ -33,6 +34,10 @@ pub struct ServerContext {
     pub consolidation_semaphore: Arc<Semaphore>,
     /// Counter for consolidation runs (for periodic clustering)
     pub consolidation_run_count: std::sync::atomic::AtomicU64,
+    /// Rate limiter: start of the current 60-second window (unix timestamp in millis)
+    pub rate_limit_window: AtomicU64,
+    /// Rate limiter: number of tool calls in the current window
+    pub rate_limit_count: AtomicU64,
 }
 
 /// Run the MCP server
@@ -61,6 +66,8 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
         cwd,
         consolidation_semaphore: Arc::new(Semaphore::new(1)),
         consolidation_run_count: std::sync::atomic::AtomicU64::new(0),
+        rate_limit_window: AtomicU64::new(0),
+        rate_limit_count: AtomicU64::new(0),
     };
 
     let stdin = io::stdin();
@@ -190,6 +197,28 @@ fn handle_call_tool(
     };
 
     tracing::info!("Calling tool: {}", params.name);
+
+    // Rate limiting: 60 calls per 60-second window
+    {
+        const MAX_CALLS_PER_MINUTE: u64 = 60;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let window = ctx.rate_limit_window.load(Ordering::Relaxed);
+        if now_ms - window > 60_000 {
+            // Reset window
+            ctx.rate_limit_window.store(now_ms, Ordering::Relaxed);
+            ctx.rate_limit_count.store(1, Ordering::Relaxed);
+        } else {
+            let count = ctx.rate_limit_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if count > MAX_CALLS_PER_MINUTE {
+                let result =
+                    super::protocol::CallToolResult::error("Rate limit exceeded, try again later");
+                return Response::success(id, serde_json::to_value(result).unwrap());
+            }
+        }
+    }
 
     // Execute tool async with fresh DB connection and retry logic
     let result = rt.block_on(execute_tool(ctx, &params.name, params.arguments));

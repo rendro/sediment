@@ -58,6 +58,27 @@ jobs:
             ${{ matrix.name }}.tar.gz
             ${{ matrix.name }}.tar.gz.sha256
 
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download SHA256 files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download ${{ github.ref_name }} \
+            --repo ${{ github.repository }} \
+            --pattern "*.sha256"
+
+      - name: Generate checksums.txt
+        run: |
+          cat *.sha256 > checksums.txt
+
+      - name: Upload checksums.txt
+        uses: softprops/action-gh-release@v1
+        with:
+          files: checksums.txt
+
   publish-crate:
     needs: build
     runs-on: ubuntu-latest

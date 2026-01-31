@@ -6,7 +6,7 @@
 //!
 //! - **Embedded storage** - LanceDB-powered, directory-based, no server required
 //! - **Local embeddings** - Uses `all-MiniLM-L6-v2` locally, no API keys needed
-//! - **MCP-native** - 4 tools for seamless LLM integration
+//! - **MCP-native** - 5 tools for seamless LLM integration
 //! - **Project-aware** - Scoped memories with automatic project detection
 //! - **Auto-chunking** - Long content is automatically chunked for better search
 
@@ -168,7 +168,7 @@ pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> 
     // Save config
     let content =
         serde_json::to_string_pretty(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(&config_path, content)?;
+    std::fs::write(&config_path, &content)?;
 
     Ok(config.project_id)
 }
@@ -202,7 +202,13 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
         current = current.parent()?.to_path_buf();
     }
 
+    let mut depth = 0;
     loop {
+        if depth >= 100 {
+            return None;
+        }
+        depth += 1;
+
         // Check for .sediment directory first (explicit project marker)
         if current.join(".sediment").is_dir() {
             return Some(current);
@@ -213,8 +219,9 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
             return Some(current);
         }
 
-        // Move to parent directory
+        // Move to parent directory; stop at filesystem root
         match current.parent() {
+            Some(parent) if parent == current => return None,
             Some(parent) => current = parent.to_path_buf(),
             None => return None,
         }

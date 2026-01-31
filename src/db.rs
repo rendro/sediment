@@ -24,6 +24,7 @@ use lancedb::connect;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use tracing::{debug, info};
 
+use crate::boost_similarity;
 use crate::chunker::{ChunkingConfig, chunk_content};
 use crate::document::ContentType;
 use crate::embedder::{EMBEDDING_DIM, Embedder};
@@ -288,16 +289,6 @@ impl Database {
             item.project_id = self.project_id.clone();
         }
 
-        // Check for potential conflicts before storing
-        let potential_conflicts = self
-            .find_similar_items(
-                &item.content,
-                CONFLICT_SIMILARITY_THRESHOLD,
-                CONFLICT_SEARCH_LIMIT,
-            )
-            .await
-            .unwrap_or_default();
-
         // Determine if we need to chunk
         let should_chunk = item.content.len() > CHUNK_THRESHOLD;
         item.is_chunked = should_chunk;
@@ -359,6 +350,19 @@ impl Database {
         } else {
             debug!("Stored item: {} (no chunking)", item.id);
         }
+
+        // Detect conflicts after storing (informational only, avoids TOCTOU race)
+        let potential_conflicts = self
+            .find_similar_items(
+                &item.content,
+                CONFLICT_SIMILARITY_THRESHOLD,
+                CONFLICT_SEARCH_LIMIT,
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.id != item.id)
+            .collect();
 
         Ok(StoreResult {
             id: item.id,
@@ -751,7 +755,7 @@ impl Database {
 
         // Delete then re-insert with new expiration
         table
-            .delete(&format!("id = '{}'", id))
+            .delete(&format!("id = '{}'", sanitize_sql_string(id)))
             .await
             .map_err(|e| SedimentError::Database(format!("Delete for expire failed: {}", e)))?;
 
@@ -810,6 +814,31 @@ impl Database {
 
         Ok(stats)
     }
+
+    /// Delete items whose expires_at timestamp is in the past.
+    pub async fn cleanup_expired(&self) -> Result<usize> {
+        let table = match &self.items_table {
+            Some(t) => t,
+            None => return Ok(0),
+        };
+
+        let now = Utc::now().timestamp();
+        let filter = format!("expires_at IS NOT NULL AND expires_at < {}", now);
+
+        // Count how many will be deleted
+        let count = table.count_rows(Some(filter.clone())).await.unwrap_or(0);
+
+        if count > 0 {
+            table
+                .delete(&filter)
+                .await
+                .map_err(|e| SedimentError::Database(format!("Expired cleanup failed: {}", e)))?;
+
+            info!("Cleaned up {} expired items", count);
+        }
+
+        Ok(count)
+    }
 }
 
 // ==================== Decay Scoring ====================
@@ -840,15 +869,6 @@ pub fn score_with_decay(
 }
 
 // ==================== Helper Functions ====================
-
-/// Apply similarity boosting based on project context.
-fn boost_similarity(base: f32, item_project: Option<&str>, current_project: Option<&str>) -> f32 {
-    match (item_project, current_project) {
-        (Some(m), Some(c)) if m == c => (base * 1.15).min(1.0), // Same project: boost
-        (Some(_), Some(_)) => base * 0.95,                      // Different project: slight penalty
-        _ => base,                                              // Global or no context
-    }
-}
 
 /// Detect content type for smart chunking
 fn detect_content_type(content: &str) -> ContentType {
@@ -1037,12 +1057,20 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
             if c.is_null(i) {
                 None
             } else {
-                Some(Utc.timestamp_opt(c.value(i), 0).unwrap())
+                Some(
+                    Utc.timestamp_opt(c.value(i), 0)
+                        .single()
+                        .unwrap_or_else(Utc::now),
+                )
             }
         });
 
         let created_at = created_at_col
-            .map(|c| Utc.timestamp_opt(c.value(i), 0).unwrap())
+            .map(|c| {
+                Utc.timestamp_opt(c.value(i), 0)
+                    .single()
+                    .unwrap_or_else(Utc::now)
+            })
             .unwrap_or_else(Utc::now);
 
         let item = Item {

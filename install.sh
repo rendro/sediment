@@ -46,6 +46,33 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 curl -fsSL "$URL" -o "${TMPDIR}/${TARBALL}"
+
+# Verify SHA256 checksum if checksums.txt is available
+CHECKSUMS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/checksums.txt"
+if curl -fsSL "$CHECKSUMS_URL" -o "${TMPDIR}/checksums.txt" 2>/dev/null; then
+  EXPECTED="$(grep "${TARBALL}" "${TMPDIR}/checksums.txt" | awk '{print $1}')"
+  if [ -n "$EXPECTED" ]; then
+    if command -v sha256sum &>/dev/null; then
+      ACTUAL="$(sha256sum "${TMPDIR}/${TARBALL}" | awk '{print $1}')"
+    elif command -v shasum &>/dev/null; then
+      ACTUAL="$(shasum -a 256 "${TMPDIR}/${TARBALL}" | awk '{print $1}')"
+    else
+      echo "Warning: no sha256sum or shasum found, skipping checksum verification" >&2
+      ACTUAL=""
+    fi
+    if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
+      echo "Checksum verification failed!" >&2
+      echo "  Expected: $EXPECTED" >&2
+      echo "  Actual:   $ACTUAL" >&2
+      exit 1
+    elif [ -n "$ACTUAL" ]; then
+      echo "Checksum verified."
+    fi
+  fi
+else
+  echo "No checksums.txt available, skipping verification."
+fi
+
 tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
 
 # Install

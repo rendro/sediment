@@ -111,40 +111,40 @@ pub fn chunk_content(
 /// Split text at sentence boundaries
 fn split_at_sentences(text: &str) -> Vec<&str> {
     let mut sentences = Vec::new();
-    let bytes = text.as_bytes();
     let mut start = 0;
-    let mut i = 0;
+    let mut char_indices = text.char_indices().peekable();
 
-    while i < bytes.len() {
-        // Look for sentence-ending punctuation followed by space or end
-        if matches!(bytes[i], b'.' | b'?' | b'!') {
-            let next_idx = i + 1;
-            if next_idx >= bytes.len()
-                || bytes[next_idx] == b' '
-                || bytes[next_idx] == b'\n'
-                || bytes[next_idx] == b'\t'
-            {
-                // Include the punctuation
-                let end = i + 1;
-                if start < end && end <= bytes.len() {
+    while let Some((i, ch)) = char_indices.next() {
+        // Look for sentence-ending punctuation (ASCII and Unicode)
+        if matches!(ch, '.' | '?' | '!' | '。' | '？' | '！') {
+            let end = i + ch.len_utf8();
+            // Check if followed by whitespace or end of text
+            let at_end_or_ws = match char_indices.peek() {
+                None => true,
+                Some(&(_, next_ch)) => next_ch == ' ' || next_ch == '\n' || next_ch == '\t',
+            };
+            if at_end_or_ws {
+                if start < end {
                     sentences.push(&text[start..end]);
                 }
                 // Skip whitespace after punctuation
-                i += 1;
-                while i < bytes.len()
-                    && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\t')
-                {
-                    i += 1;
+                while let Some(&(_, next_ch)) = char_indices.peek() {
+                    if next_ch == ' ' || next_ch == '\n' || next_ch == '\t' {
+                        char_indices.next();
+                    } else {
+                        break;
+                    }
                 }
-                start = i;
-                continue;
+                start = match char_indices.peek() {
+                    Some(&(idx, _)) => idx,
+                    None => text.len(),
+                };
             }
         }
-        i += 1;
     }
 
     // Add remaining text
-    if start < bytes.len() {
+    if start < text.len() {
         sentences.push(&text[start..]);
     }
 

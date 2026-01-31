@@ -32,6 +32,8 @@ impl ConsolidationQueue {
             SedimentError::Database(format!("Failed to open consolidation database: {}", e))
         })?;
 
+        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS consolidation_queue (
                 item_id_a TEXT NOT NULL,
@@ -180,7 +182,11 @@ async fn run_consolidation_batch(
         let result = process_candidate(&mut db, access_db_path, candidate).await;
         match result {
             Ok(status) => {
-                let _ = queue.mark_processed(&candidate.item_id_a, &candidate.item_id_b, &status);
+                if let Err(e) =
+                    queue.mark_processed(&candidate.item_id_a, &candidate.item_id_b, &status)
+                {
+                    tracing::warn!("mark_processed failed: {}", e);
+                }
                 info!(
                     "Consolidated {} <-> {}: {} (similarity: {:.2})",
                     candidate.item_id_a, candidate.item_id_b, status, candidate.similarity
@@ -220,26 +226,38 @@ async fn process_candidate(
                 };
 
                 // Transfer edges from old to new
-                let _ = graph.transfer_edges(&remove.id, &keep.id);
+                if let Err(e) = graph.transfer_edges(&remove.id, &keep.id) {
+                    tracing::warn!("transfer_edges failed: {}", e);
+                }
 
                 // Create SUPERSEDES edge (preserves lineage for recovery)
-                let _ = graph.add_supersedes_edge(&keep.id, &remove.id);
+                if let Err(e) = graph.add_supersedes_edge(&keep.id, &remove.id) {
+                    tracing::warn!("add_supersedes_edge failed: {}", e);
+                }
 
                 // Archive the removed item's content into a RELATED edge label
                 // so it can be recovered if this was a false positive merge.
                 // The edge label stores a truncated snapshot; full content is
                 // preserved in the SUPERSEDES relationship for audit.
-                let archive_preview = if remove.content.len() > 500 {
-                    format!("{}...", &remove.content[..497])
+                let archive_preview = if remove.content.chars().count() > 500 {
+                    let cut = remove
+                        .content
+                        .char_indices()
+                        .nth(497)
+                        .map(|(i, _)| i)
+                        .unwrap_or(remove.content.len());
+                    format!("{}...", &remove.content[..cut])
                 } else {
                     remove.content.clone()
                 };
-                let _ = graph.add_related_edge(
+                if let Err(e) = graph.add_related_edge(
                     &keep.id,
                     &remove.id,
                     candidate.similarity,
                     &format!("merged_archive:{}", archive_preview),
-                );
+                ) {
+                    tracing::warn!("add_related_edge failed: {}", e);
+                }
 
                 // Soft-delete: mark item as expired instead of hard-deleting.
                 // This allows recovery; expired items are excluded from search
@@ -249,7 +267,9 @@ async fn process_candidate(
                     // Fall back to hard delete if expire is not supported
                     warn!("expire_item failed ({}), falling back to delete", e);
                     db.delete_item(&remove.id).await?;
-                    let _ = graph.remove_node(&remove.id);
+                    if let Err(e) = graph.remove_node(&remove.id) {
+                        tracing::warn!("remove_node failed: {}", e);
+                    }
                 }
 
                 Ok("merged".to_string())
@@ -261,12 +281,14 @@ async fn process_candidate(
         }
     } else {
         // Similar but distinct: create RELATED edge
-        let _ = graph.add_related_edge(
+        if let Err(e) = graph.add_related_edge(
             &candidate.item_id_a,
             &candidate.item_id_b,
             candidate.similarity,
             "similar",
-        );
+        ) {
+            tracing::warn!("add_related_edge failed: {}", e);
+        }
         Ok("linked".to_string())
     }
 }

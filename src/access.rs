@@ -30,6 +30,8 @@ impl AccessTracker {
             SedimentError::Database(format!("Failed to open access database: {}", e))
         })?;
 
+        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS access_log (
                 item_id TEXT PRIMARY KEY,
