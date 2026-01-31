@@ -170,6 +170,16 @@ All local, embedded, zero config:
 - **Conflict detection**: Items with ≥0.85 similarity flagged on store.
 - **Cross-project recall**: Results from other projects flagged with provenance metadata.
 - **Local embeddings**: all-MiniLM-L6-v2 via Candle (384-dim vectors, no API keys).
+- **Model integrity**: SHA-256 verification of all model files on every load, pinned to a specific revision.
+
+### Security
+
+- **Input bounds**: Content (1MB), queries (100KB), JSON-RPC lines (10MB), tags (50×200B), metadata (100KB).
+- **Rate limiting**: 60 tool calls per minute.
+- **SQL injection prevention**: Sanitized filter expressions for LanceDB; parameterized queries for SQLite.
+- **Cross-project access control**: Replace, forget, and connections enforce project isolation. Cross-project content is redacted in recall results.
+- **Error sanitization**: Internal errors logged to stderr; only generic messages returned to MCP clients.
+- **Retry with backoff**: Transient failures retried with exponential backoff (3 attempts, 100ms–2s).
 
 ## Performance
 
