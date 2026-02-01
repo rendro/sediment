@@ -848,8 +848,10 @@ async fn execute_recall(
         None => return CallToolResult::error("Missing parameters"),
     };
 
-    // Reject oversized queries to prevent OOM during tokenization
-    const MAX_QUERY_BYTES: usize = 100_000;
+    // Reject oversized queries to prevent OOM during tokenization.
+    // The model truncates to 512 tokens (~2KB of English text), so anything
+    // beyond 10KB is wasted processing.
+    const MAX_QUERY_BYTES: usize = 10_000;
     if params.query.len() > MAX_QUERY_BYTES {
         return CallToolResult::error(format!(
             "Query too large: {} bytes (max {} bytes)",

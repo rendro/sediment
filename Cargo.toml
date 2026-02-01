@@ -63,6 +63,9 @@ tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 rand = "0.8"
 
+[profile.release]
+panic = "abort"
+
 [[bench]]
 name = "recall_bench"
 harness = false

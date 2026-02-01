@@ -66,15 +66,18 @@ impl Embedder {
             .with_truncation(Some(truncation))
             .map_err(|e| SedimentError::Tokenizer(format!("Failed to set truncation: {}", e)))?;
 
-        // Load model weights
-        // SAFETY: The safetensors files are SHA-256 verified against hardcoded hashes
-        // (see verify_all_model_files), ensuring they are valid safetensors format.
-        // Memory-mapping valid safetensors files is safe per the candle API contract.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[model_path], DTYPE, &device).map_err(|e| {
+        // Load model weights into memory and verify integrity.
+        // Uses from_buffered_safetensors instead of unsafe from_mmaped_safetensors
+        // to eliminate the TOCTOU window between hash verification and file use.
+        // The same bytes that pass SHA-256 verification are the ones parsed.
+        let model_bytes = std::fs::read(&model_path).map_err(|e| {
+            SedimentError::ModelLoading(format!("Failed to read model weights: {}", e))
+        })?;
+        verify_bytes_hash(&model_bytes, MODEL_SHA256, "model.safetensors")?;
+        let vb =
+            VarBuilder::from_buffered_safetensors(model_bytes, DTYPE, &device).map_err(|e| {
                 SedimentError::ModelLoading(format!("Failed to load weights: {}", e))
-            })?
-        };
+            })?;
 
         let model = BertModel::load(vb, &config)
             .map_err(|e| SedimentError::ModelLoading(format!("Failed to load model: {}", e)))?;
@@ -92,10 +95,9 @@ impl Embedder {
     /// Embed a single text
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let embeddings = self.embed_batch(&[text])?;
-        Ok(embeddings
-            .into_iter()
-            .next()
-            .expect("embed_batch with non-empty input always returns at least one embedding"))
+        embeddings.into_iter().next().ok_or_else(|| {
+            SedimentError::Embedding("embed_batch returned empty result for non-empty input".into())
+        })
     }
 
     /// Embed multiple texts at once
@@ -224,11 +226,12 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
         .get("config.json")
         .map_err(|e| SedimentError::ModelLoading(format!("Failed to download config: {}", e)))?;
 
-    // Verify integrity of all model files using hardcoded SHA-256 hashes.
-    // This protects against cache poisoning where an attacker modifies files
-    // in ~/.cache/huggingface/ after download. The hashes are compile-time
-    // constants tied to the pinned git revision above.
-    verify_all_model_files(&model_path, &tokenizer_path, &config_path)?;
+    // Verify integrity of tokenizer and config files using hardcoded SHA-256 hashes.
+    // The model weights file is verified later via verify_bytes_hash on the actual
+    // bytes passed to from_buffered_safetensors, eliminating any TOCTOU window.
+    verify_file_hash(&tokenizer_path, TOKENIZER_SHA256, "tokenizer.json")?;
+    verify_file_hash(&config_path, CONFIG_SHA256, "config.json")?;
+    info!("Tokenizer and config integrity verified (SHA-256)");
 
     Ok((model_path, tokenizer_path, config_path))
 }
@@ -262,16 +265,23 @@ fn verify_file_hash(path: &std::path::Path, expected: &str, file_label: &str) ->
     Ok(())
 }
 
-/// Verify integrity of all model files (model weights, tokenizer, config).
-fn verify_all_model_files(
-    model_path: &std::path::Path,
-    tokenizer_path: &std::path::Path,
-    config_path: &std::path::Path,
-) -> Result<()> {
-    verify_file_hash(model_path, MODEL_SHA256, "model.safetensors")?;
-    verify_file_hash(tokenizer_path, TOKENIZER_SHA256, "tokenizer.json")?;
-    verify_file_hash(config_path, CONFIG_SHA256, "config.json")?;
-    info!("All model files integrity verified (SHA-256)");
+/// Verify the SHA-256 hash of in-memory bytes against an expected value.
+///
+/// This is used for model weights to eliminate the TOCTOU window: the same bytes
+/// that are hash-verified are the ones passed to the safetensors parser.
+fn verify_bytes_hash(data: &[u8], expected: &str, file_label: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let hash = Sha256::digest(data);
+    let hex_hash = format!("{:x}", hash);
+
+    if hex_hash != expected {
+        return Err(SedimentError::ModelLoading(format!(
+            "{} integrity check failed: expected SHA-256 {}, got {}",
+            file_label, expected, hex_hash
+        )));
+    }
+
     Ok(())
 }
 
@@ -325,5 +335,28 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_verify_bytes_hash_correct() {
+        let data = b"hello world";
+        let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert!(verify_bytes_hash(data, expected, "test").is_ok());
+    }
+
+    #[test]
+    fn test_verify_bytes_hash_incorrect() {
+        let data = b"hello world";
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_bytes_hash(data, wrong, "test").unwrap_err();
+        assert!(err.to_string().contains("integrity check failed"));
+    }
+
+    #[test]
+    fn test_verify_bytes_hash_empty() {
+        let data = b"";
+        // SHA-256 of empty input
+        let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(verify_bytes_hash(data, expected, "empty").is_ok());
     }
 }

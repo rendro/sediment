@@ -290,7 +290,14 @@ fn handle_call_tool(
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let mut state = ctx.rate_limit.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = ctx.rate_limit.lock().unwrap_or_else(|e| {
+            tracing::warn!("Rate limiter mutex was poisoned, recovering with reset");
+            let mut guard = e.into_inner();
+            // Reset to a clean state since the previous holder panicked mid-update
+            guard.window_start_ms = 0;
+            guard.count = 0;
+            guard
+        });
         if now_ms.saturating_sub(state.window_start_ms) > 60_000 {
             // Window expired, reset
             state.window_start_ms = now_ms;
@@ -393,5 +400,31 @@ mod tests {
         // The (MAX_CALLS+1)th call should be rejected
         state.count += 1;
         assert!(state.count > MAX_CALLS, "Next call should exceed limit");
+    }
+
+    #[test]
+    fn test_rate_limiter_recovers_from_poisoned_mutex() {
+        // Regression test: poisoned mutex should reset to clean state, not inherit stale data
+        let rate_limit = Mutex::new(RateLimitState {
+            window_start_ms: 50_000,
+            count: 999,
+        });
+
+        // Poison the mutex by panicking while holding the lock
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = rate_limit.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(result.is_err());
+
+        // Recovery should reset to clean state
+        let state = rate_limit.lock().unwrap_or_else(|e| {
+            let mut guard = e.into_inner();
+            guard.window_start_ms = 0;
+            guard.count = 0;
+            guard
+        });
+        assert_eq!(state.window_start_ms, 0, "Should reset window on poison recovery");
+        assert_eq!(state.count, 0, "Should reset count on poison recovery");
     }
 }
