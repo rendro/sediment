@@ -11,7 +11,7 @@ Combines vector search, a relationship graph, and access tracking into a unified
 ## Why Sediment?
 
 - **Single binary, zero config** — no Docker, no Postgres, no Qdrant. Just `sediment`.
-- **Sub-25ms recall** — local embeddings and vector search, no network round-trips.
+- **Sub-16ms recall** — local embeddings and vector search at 100 items, no network round-trips.
 - **5-tool focused API** — `store`, `recall`, `list`, `forget`, `connections`. That's it.
 - **Works everywhere** — macOS (Intel + ARM), Linux x86_64. All data stays on your machine.
 
@@ -133,7 +133,7 @@ Go to **Settings > Tools > AI Assistant > MCP Servers**, click **+**, and add:
 
 | Tool | Description |
 |------|-------------|
-| `store` | Save content with optional title, tags, metadata, expiration, scope, replace, and related item links |
+| `store` | Save content with optional title, tags, source, metadata, expiration, scope, replace, and related item links |
 | `recall` | Search memories by semantic similarity with decay scoring, trust weighting, graph expansion, and co-access suggestions |
 | `list` | List stored items by scope (project/global/all) with tag filtering |
 | `forget` | Delete an item by ID (removes from vector store and graph) |
@@ -150,13 +150,12 @@ sediment list      # List stored items
 
 ## How It Works
 
-### Three-Database Hybrid
+### Two-Database Hybrid
 
 All local, embedded, zero config:
 
 - **LanceDB** — Vector embeddings and semantic similarity search
-- **SQLite** (graph) — Relationship tracking: RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING edges
-- **SQLite** (access) — Mutable counters: access tracking, decay scoring, consolidation queue
+- **SQLite** (`access.db`) — Relationship graph, access tracking, decay scoring, consolidation queue
 
 ### Key Features
 
@@ -183,13 +182,12 @@ All local, embedded, zero config:
 
 ## Performance
 
-Sub-25ms recall latency at 10K items with full graph features enabled. See [BENCHMARKS.md](BENCHMARKS.md) for detailed numbers.
+Sub-16ms recall at 100 items with full graph features enabled. See [BENCHMARKS.md](BENCHMARKS.md) for detailed numbers.
 
 | DB Size | Graph Off | Graph On |
 |---------|-----------|----------|
-| 100     | ~8ms      | ~10ms    |
-| 1,000   | ~12ms     | ~15ms   |
-| 10,000  | ~18ms     | ~23ms   |
+| 100     | ~12ms     | ~15ms    |
+| 1,000   | ~36ms     | ~65ms   |
 
 ### Data Location
 
