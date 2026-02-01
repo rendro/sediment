@@ -424,7 +424,10 @@ mod tests {
             guard.count = 0;
             guard
         });
-        assert_eq!(state.window_start_ms, 0, "Should reset window on poison recovery");
+        assert_eq!(
+            state.window_start_ms, 0,
+            "Should reset window on poison recovery"
+        );
         assert_eq!(state.count, 0, "Should reset count on poison recovery");
     }
 }

@@ -74,10 +74,8 @@ impl Embedder {
             SedimentError::ModelLoading(format!("Failed to read model weights: {}", e))
         })?;
         verify_bytes_hash(&model_bytes, MODEL_SHA256, "model.safetensors")?;
-        let vb =
-            VarBuilder::from_buffered_safetensors(model_bytes, DTYPE, &device).map_err(|e| {
-                SedimentError::ModelLoading(format!("Failed to load weights: {}", e))
-            })?;
+        let vb = VarBuilder::from_buffered_safetensors(model_bytes, DTYPE, &device)
+            .map_err(|e| SedimentError::ModelLoading(format!("Failed to load weights: {}", e)))?;
 
         let model = BertModel::load(vb, &config)
             .map_err(|e| SedimentError::ModelLoading(format!("Failed to load model: {}", e)))?;
