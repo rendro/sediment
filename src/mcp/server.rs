@@ -281,10 +281,10 @@ fn handle_call_tool(
 
     tracing::info!("Calling tool: {}", params.name);
 
-    // Rate limiting: 60 calls per 60-second window.
-    // Uses a mutex to atomically check window expiry and increment count.
+    // Safety rate limit: guard against runaway client loops hammering IO.
+    // Generous limit since this is a local-only single-client server.
     {
-        const MAX_CALLS_PER_MINUTE: u64 = 60;
+        const MAX_CALLS_PER_MINUTE: u64 = 600;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -347,22 +347,22 @@ mod tests {
         state.window_start_ms = now_ms;
         state.count = 1;
 
-        // Now simulate 59 more calls in the same window
-        for _ in 0..59 {
+        // Now simulate 599 more calls in the same window
+        for _ in 0..599 {
             state.count += 1;
         }
-        assert_eq!(state.count, 60);
+        assert_eq!(state.count, 600);
 
-        // 61st call should exceed the limit
+        // 601st call should exceed the limit
         state.count += 1;
-        assert!(state.count > 60, "Should exceed rate limit");
+        assert!(state.count > 600, "Should exceed rate limit");
     }
 
     #[test]
     fn test_rate_limiter_resets_after_window() {
         let mut state = RateLimitState {
             window_start_ms: 100_000,
-            count: 60,
+            count: 600,
         };
 
         // Simulate time advancing past the window
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn test_rate_limiter_exactly_at_limit() {
         // Bug #7: Effective limit should be exactly MAX_CALLS, not MAX_CALLS+1.
-        const MAX_CALLS: u64 = 60;
+        const MAX_CALLS: u64 = 600;
         let mut state = RateLimitState {
             window_start_ms: 100_000,
             count: 0,
