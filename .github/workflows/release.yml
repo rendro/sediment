@@ -22,6 +22,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: sediment-x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: sediment-x86_64-unknown-linux-musl
 
     runs-on: ${{ matrix.os }}
 
@@ -37,6 +40,10 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -129,7 +136,7 @@ jobs:
         run: |
           SHA_INTEL=$(cat sediment-x86_64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
           SHA_ARM=$(cat sediment-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
-          SHA_LINUX=$(cat sediment-x86_64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
+          SHA_LINUX=$(cat sediment-x86_64-unknown-linux-musl.tar.gz.sha256 | awk '{print $1}')
 
           cat > homebrew-tap/Formula/sediment.rb <<EOF
           class Sediment < Formula
@@ -150,7 +157,7 @@ jobs:
 
             on_linux do
               on_intel do
-                url "https://github.com/rendro/sediment/releases/download/v#{version}/sediment-x86_64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/rendro/sediment/releases/download/v#{version}/sediment-x86_64-unknown-linux-musl.tar.gz"
                 sha256 "$SHA_LINUX"
               end
             end

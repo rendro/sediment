@@ -23,7 +23,7 @@ class Sediment < Formula
 
   on_linux do
     on_intel do
-      url "https://github.com/rendro/sediment/releases/download/v#{version}/sediment-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/rendro/sediment/releases/download/v#{version}/sediment-x86_64-unknown-linux-musl.tar.gz"
       sha256 "REPLACE_WITH_ACTUAL_SHA256"
     end
   end

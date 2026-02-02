@@ -8,7 +8,7 @@ INSTALL_DIR="${SEDIMENT_INSTALL_DIR:-/usr/local/bin}"
 OS="$(uname -s)"
 case "$OS" in
   Darwin) os="apple-darwin" ;;
-  Linux)  os="unknown-linux-gnu" ;;
+  Linux)  os="unknown-linux-musl" ;;
   *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
 esac
 
@@ -23,7 +23,7 @@ esac
 TARGET="${arch}-${os}"
 
 # Linux aarch64 not yet supported
-if [ "$os" = "unknown-linux-gnu" ] && [ "$arch" = "aarch64" ]; then
+if [ "$os" = "unknown-linux-musl" ] && [ "$arch" = "aarch64" ]; then
   echo "Linux aarch64 binaries are not yet available." >&2
   echo "Install from source: cargo install sediment" >&2
   exit 1
