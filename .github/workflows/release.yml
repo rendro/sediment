@@ -41,25 +41,13 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install musl tools and OpenSSL
+      - name: Install cross
         if: contains(matrix.target, 'musl')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools musl-dev
-          # Build static OpenSSL for musl
-          curl -LO https://www.openssl.org/source/openssl-3.2.0.tar.gz
-          tar xzf openssl-3.2.0.tar.gz
-          cd openssl-3.2.0
-          CC=musl-gcc ./Configure no-shared no-async linux-x86_64 --prefix=/usr/local/musl --openssldir=/usr/local/musl/ssl
-          make -j$(nproc)
-          sudo make install_sw
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build (musl)
+      - name: Build (musl with cross)
         if: contains(matrix.target, 'musl')
-        run: cargo build --release --target ${{ matrix.target }}
-        env:
-          OPENSSL_DIR: /usr/local/musl
-          OPENSSL_STATIC: "1"
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Build (non-musl)
         if: ${{ !contains(matrix.target, 'musl') }}
