@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.3] - 2026-02-03
+
+### Added
+- Statically-linked musl Linux binary in releases (fixes glibc version mismatch on older systems)
+- Shell installer and Homebrew formula now default to musl binary on Linux
+
+## [0.2.2] - 2026-02-02
+
+### Changed
+- Bumped rate limit from 60 to 600 tool calls per minute
+- Fixed security audit findings: unsafe elimination, rate limiter hardening
+
+### Added
+- Security section in README
+
 ## [0.2.1] - 2025-05-21
 
 ### Added
