@@ -54,11 +54,16 @@ jobs:
           make -j$(nproc)
           sudo make install_sw
 
-      - name: Build
+      - name: Build (musl)
+        if: contains(matrix.target, 'musl')
         run: cargo build --release --target ${{ matrix.target }}
         env:
-          OPENSSL_DIR: ${{ contains(matrix.target, 'musl') && '/usr/local/musl' || '' }}
-          OPENSSL_STATIC: ${{ contains(matrix.target, 'musl') && '1' || '' }}
+          OPENSSL_DIR: /usr/local/musl
+          OPENSSL_STATIC: "1"
+
+      - name: Build (non-musl)
+        if: ${{ !contains(matrix.target, 'musl') }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
