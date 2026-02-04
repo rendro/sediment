@@ -346,43 +346,26 @@ fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
 fn generate_claude_md_instructions() -> String {
     r#"# Sediment Memory System
 
-Use the Sediment MCP tools for persistent memory storage.
+Use `mcp__sediment__store`, `mcp__sediment__recall`, `mcp__sediment__list`, and `mcp__sediment__forget` for persistent memory.
 
-## Tools (4 total)
+## Proactive Usage
 
-- `mcp__sediment__store` - Store content for later retrieval
-- `mcp__sediment__recall` - Search by semantic similarity
-- `mcp__sediment__list` - List stored items
-- `mcp__sediment__forget` - Delete an item by ID
+- **Recall at conversation start** when context might exist (preferences, prior decisions, project conventions)
+- **Store immediately** when the user states a preference, makes a decision, or you learn something important about the codebase
+- Use `scope: "global"` for cross-project preferences; default `"project"` scope for everything else
 
-## When to Store
+## What to Store
 
-- User preferences (e.g., "I prefer X over Y")
-- Project conventions and decisions
-- Important learnings about the codebase
-- Reference material, API docs, specifications
+- User preferences and working style
+- Architectural decisions and rationale
+- Project conventions (naming, patterns, tools)
+- Non-obvious learnings about the codebase
 
-## Usage Examples
+## What NOT to Store
 
-Store a preference:
-```json
-{"content": "User prefers dark mode"}
-```
-
-Store a document (auto-chunked if long):
-```json
-{"content": "<long content>", "scope": "global"}
-```
-
-Search:
-```json
-{"query": "user preferences"}
-```
-
-## Scopes
-
-- `project` - Items specific to this project (default)
-- `global` - Items shared across all projects
+- Transient task context (current debugging session, temporary workarounds)
+- Information already in CLAUDE.md or README
+- Obvious facts derivable from code
 "#
     .to_string()
 }
