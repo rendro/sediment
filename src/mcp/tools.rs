@@ -1,10 +1,9 @@
 //! MCP Tool definitions for Sediment
 //!
-//! 5 tools: store, recall, list, forget, connections
+//! 4 tools: store, recall, list, forget
 
 use std::sync::Arc;
 
-use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -30,7 +29,7 @@ fn spawn_logged(name: &'static str, fut: impl std::future::Future<Output = ()> +
     });
 }
 
-/// Get all available tools (5 total)
+/// Get all available tools (4 total)
 pub fn get_tools() -> Vec<Tool> {
     vec![
         Tool {
@@ -43,41 +42,11 @@ pub fn get_tools() -> Vec<Tool> {
                         "type": "string",
                         "description": "The content to store"
                     },
-                    "title": {
-                        "type": "string",
-                        "description": "Optional title (recommended for long content)"
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Tags for categorization"
-                    },
-                    "source": {
-                        "type": "string",
-                        "description": "Source attribution (e.g., URL, file path, 'conversation')"
-                    },
-                    "metadata": {
-                        "type": "object",
-                        "description": "Custom JSON metadata"
-                    },
-                    "expires_at": {
-                        "type": "string",
-                        "description": "ISO datetime when this should expire (optional)"
-                    },
                     "scope": {
                         "type": "string",
                         "enum": ["project", "global"],
                         "default": "project",
                         "description": "Where to store: 'project' (current project) or 'global' (all projects)"
-                    },
-                    "replace": {
-                        "type": "string",
-                        "description": "ID of an existing item to replace (stores new item first, then deletes old)"
-                    },
-                    "related": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "IDs of related items to link in the knowledge graph"
                     }
                 },
                 "required": ["content"]
@@ -97,16 +66,6 @@ pub fn get_tools() -> Vec<Tool> {
                         "type": "number",
                         "default": 5,
                         "description": "Maximum number of results"
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Filter by tags (any match)"
-                    },
-                    "min_similarity": {
-                        "type": "number",
-                        "default": 0.3,
-                        "description": "Minimum similarity threshold (0.0-1.0). Lower values return more results."
                     }
                 },
                 "required": ["query"]
@@ -114,15 +73,10 @@ pub fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "list".to_string(),
-            description: "List stored items with optional filtering.".to_string(),
+            description: "List stored items.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "tags": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Filter by tags"
-                    },
                     "limit": {
                         "type": "number",
                         "default": 10,
@@ -151,20 +105,6 @@ pub fn get_tools() -> Vec<Tool> {
                 "required": ["id"]
             }),
         },
-        Tool {
-            name: "connections".to_string(),
-            description: "Show the relationship graph for a stored item. Returns all connections including related items, superseded items, and frequently co-accessed items.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "The item ID to show connections for"
-                    }
-                },
-                "required": ["id"]
-            }),
-        },
     ]
 }
 
@@ -174,21 +114,7 @@ pub fn get_tools() -> Vec<Tool> {
 pub struct StoreParams {
     pub content: String,
     #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub tags: Option<Vec<String>>,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
-    pub metadata: Option<Value>,
-    #[serde(default)]
-    pub expires_at: Option<String>,
-    #[serde(default)]
     pub scope: Option<String>,
-    #[serde(default)]
-    pub replace: Option<String>,
-    #[serde(default)]
-    pub related: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,16 +122,10 @@ pub struct RecallParams {
     pub query: String,
     #[serde(default)]
     pub limit: Option<usize>,
-    #[serde(default)]
-    pub tags: Option<Vec<String>>,
-    #[serde(default)]
-    pub min_similarity: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
-    #[serde(default)]
-    pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -214,11 +134,6 @@ pub struct ListParams {
 
 #[derive(Debug, Deserialize)]
 pub struct ForgetParams {
-    pub id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ConnectionsParams {
     pub id: String,
 }
 
@@ -289,7 +204,6 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
                 "recall" => execute_recall(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
                 "list" => execute_list(&mut db, args_clone).await,
                 "forget" => execute_forget(&mut db, &graph, ctx_ref, args_clone).await,
-                "connections" => execute_connections(&mut db, &graph, ctx_ref, args_clone).await,
                 _ => return Ok(CallToolResult::error(format!("Unknown tool: {}", name_ref))),
             };
 
@@ -336,7 +250,7 @@ fn is_retryable_error(error_msg: &str) -> bool {
 
 async fn execute_store(
     db: &mut Database,
-    tracker: &AccessTracker,
+    _tracker: &AccessTracker,
     graph: &GraphStore,
     ctx: &ServerContext,
     args: Option<Value>,
@@ -364,62 +278,6 @@ async fn execute_store(
         ));
     }
 
-    // Validate field sizes to prevent abuse
-    const MAX_TITLE_LEN: usize = 1000;
-    const MAX_SOURCE_LEN: usize = 2000;
-    const MAX_TAG_LEN: usize = 200;
-    const MAX_TAG_COUNT: usize = 50;
-    const MAX_METADATA_BYTES: usize = 100_000;
-
-    if let Some(ref title) = params.title
-        && title.len() > MAX_TITLE_LEN
-    {
-        return CallToolResult::error(format!(
-            "Title too large: {} bytes (max {})",
-            title.len(),
-            MAX_TITLE_LEN
-        ));
-    }
-
-    if let Some(ref source) = params.source
-        && source.len() > MAX_SOURCE_LEN
-    {
-        return CallToolResult::error(format!(
-            "Source too large: {} bytes (max {})",
-            source.len(),
-            MAX_SOURCE_LEN
-        ));
-    }
-
-    if let Some(ref tags) = params.tags {
-        if tags.len() > MAX_TAG_COUNT {
-            return CallToolResult::error(format!(
-                "Too many tags: {} (max {})",
-                tags.len(),
-                MAX_TAG_COUNT
-            ));
-        }
-        for tag in tags {
-            if tag.len() > MAX_TAG_LEN {
-                return CallToolResult::error(format!(
-                    "Tag too large: {} bytes (max {})",
-                    tag.len(),
-                    MAX_TAG_LEN
-                ));
-            }
-        }
-    }
-
-    if let Some(ref metadata) = params.metadata {
-        let meta_size = metadata.to_string().len();
-        if meta_size > MAX_METADATA_BYTES {
-            return CallToolResult::error(format!(
-                "Metadata too large: {} bytes (max {})",
-                meta_size, MAX_METADATA_BYTES
-            ));
-        }
-    }
-
     // Parse scope
     let scope = params
         .scope
@@ -432,109 +290,14 @@ async fn execute_store(
         Err(e) => return CallToolResult::error(e),
     };
 
-    // Parse expires_at if provided
-    let expires_at = if let Some(ref exp_str) = params.expires_at {
-        match DateTime::parse_from_rfc3339(exp_str) {
-            Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
-            Err(e) => return CallToolResult::error(format!("Invalid expires_at: {}", e)),
-        }
-    } else {
-        None
-    };
-
-    // Validate that the item to replace exists and belongs to the current project
-    let replaced_id = if let Some(ref replace_id) = params.replace {
-        match db.get_item(replace_id).await {
-            Ok(Some(item)) => {
-                // Access control: prevent replacing items from other projects
-                if let Some(ref current_pid) = ctx.project_id
-                    && let Some(ref item_pid) = item.project_id
-                    && item_pid != current_pid
-                {
-                    return CallToolResult::error(format!(
-                        "Cannot replace item {} from a different project",
-                        replace_id
-                    ));
-                }
-                Some(replace_id.clone())
-            }
-            Ok(None) => {
-                return CallToolResult::error(format!(
-                    "Cannot replace: item not found: {}",
-                    replace_id
-                ));
-            }
-            Err(e) => {
-                return sanitized_error("Failed to look up item for replace", e);
-            }
-        }
-    } else {
-        None
-    };
-
     // Build item
-    let mut tags = params.tags.unwrap_or_default();
-    let mut item = Item::new(&params.content).with_tags(tags.clone());
-
-    if let Some(title) = params.title {
-        item = item.with_title(title);
-    }
-
-    if let Some(source) = params.source {
-        item = item.with_source(source);
-    }
-
-    // Build metadata with provenance
-    let mut metadata = params.metadata.unwrap_or(json!({}));
-    if let Some(obj) = metadata.as_object_mut() {
-        let mut provenance = json!({
-            "v": 1,
-            "project_path": ctx.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "unknown".to_string())
-        });
-        if let Some(ref rid) = replaced_id {
-            provenance["supersedes"] = json!(rid);
-        }
-        obj.insert("_provenance".to_string(), provenance);
-    }
-    item = item.with_metadata(metadata);
-
-    if let Some(exp) = expires_at {
-        item = item.with_expires_at(exp);
-    }
+    let mut item = Item::new(&params.content);
 
     // Set project_id based on scope
     if scope == StoreScope::Project
         && let Some(project_id) = db.project_id()
     {
         item = item.with_project_id(project_id);
-    }
-
-    // Auto-tag inference (Phase 4a): if no user tags, infer from similar items
-    if tags.is_empty()
-        && let Ok(similar) = db.find_similar_items(&params.content, 0.85, 5).await
-    {
-        let mut tag_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for conflict in &similar {
-            if let Some(similar_item) = db.get_item(&conflict.id).await.ok().flatten() {
-                for tag in &similar_item.tags {
-                    if !tag.starts_with("auto:") {
-                        *tag_counts.entry(tag.clone()).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-        // If 2+ similar items share a tag, auto-apply it
-        let auto_tags: Vec<String> = tag_counts
-            .into_iter()
-            .filter(|(_, count)| *count >= 2)
-            .map(|(tag, _)| format!("auto:{}", tag))
-            .collect();
-        if !auto_tags.is_empty() {
-            tags = item.tags.clone();
-            tags.extend(auto_tags);
-            item = item.with_tags(tags);
-        }
     }
 
     match db.store_item(item).await {
@@ -546,64 +309,6 @@ async fn execute_store(
             let project_id = db.project_id().map(|s| s.to_string());
             if let Err(e) = graph.add_node(&new_id, project_id.as_deref(), now) {
                 tracing::warn!("graph add_node failed: {}", e);
-            }
-
-            // Complete replace: now that the new item is stored, delete the old one.
-            // Intentionally non-atomic (store-before-delete): if the process crashes
-            // between store and delete, both items exist (benign duplication, not data
-            // loss). The consolidation system will detect and merge duplicates.
-            if let Some(ref old_id) = replaced_id {
-                // Record validation on the NEW item (the replacement is a "confirmed" version)
-                let now_ts = chrono::Utc::now().timestamp();
-                if let Err(e) = tracker.record_validation(&new_id, now_ts) {
-                    tracing::warn!("record_validation failed: {}", e);
-                }
-                // Transfer graph edges from old node to new node before removing old node
-                // If this fails, abort the replace to avoid inconsistent state
-                if let Err(e) = graph.transfer_edges(old_id, &new_id) {
-                    tracing::error!("transfer_edges failed, aborting replace: {}", e);
-                    // Compensating action: remove the new item since replace failed
-                    let _ = db.delete_item(&new_id).await;
-                    let _ = graph.remove_node(&new_id);
-                    return CallToolResult::error(
-                        "Replace failed during edge transfer. Original item preserved.",
-                    );
-                }
-                // Create SUPERSEDES edge (non-critical, continue on failure)
-                if let Err(e) = graph.add_supersedes_edge(&new_id, old_id) {
-                    tracing::warn!("add_supersedes_edge failed: {}", e);
-                }
-                // Delete old item from LanceDB
-                if let Err(e) = db.delete_item(old_id).await {
-                    tracing::error!(
-                        "delete_item failed during replace: {}. Old item may remain as duplicate.",
-                        e
-                    );
-                }
-                // Remove old graph node (and its remaining edges)
-                if let Err(e) = graph.remove_node(old_id) {
-                    tracing::warn!("remove_node failed: {}", e);
-                }
-            }
-
-            // Create RELATED edges if specified (only for IDs that exist in LanceDB)
-            if let Some(ref related_ids) = params.related {
-                let rid_refs: Vec<&str> = related_ids.iter().map(|s| s.as_str()).collect();
-                let existing_items = db.get_items_batch(&rid_refs).await.unwrap_or_default();
-                let valid_ids: std::collections::HashSet<&str> =
-                    existing_items.iter().map(|i| i.id.as_str()).collect();
-
-                for rid in related_ids {
-                    if !valid_ids.contains(rid.as_str()) {
-                        tracing::warn!("related ID not found, skipping edge: {}", rid);
-                        continue;
-                    }
-                    // Ensure target node exists in graph before creating edge
-                    let _ = graph.ensure_node_exists(rid, None, now);
-                    if let Err(e) = graph.add_related_edge(&new_id, rid, 1.0, "user_linked") {
-                        tracing::warn!("add_related_edge failed: {}", e);
-                    }
-                }
             }
 
             // Enqueue consolidation candidates from conflicts
@@ -861,13 +566,8 @@ async fn execute_recall(
     }
 
     let limit = params.limit.unwrap_or(5).min(100);
-    let min_similarity = params.min_similarity.unwrap_or(0.3);
 
-    let mut filters = ItemFilters::new().with_min_similarity(min_similarity);
-
-    if let Some(tags) = params.tags {
-        filters = filters.with_tags(tags);
-    }
+    let filters = ItemFilters::new();
 
     let config = RecallConfig::default();
 
@@ -906,28 +606,16 @@ async fn execute_recall(
             if let Some(ref excerpt) = r.relevant_excerpt {
                 obj["relevant_excerpt"] = json!(excerpt);
             }
-            if !r.tags.is_empty() {
-                obj["tags"] = json!(r.tags);
-            }
-            if let Some(ref source) = r.source {
-                obj["source"] = json!(source);
-            }
 
-            // Cross-project flag (Phase 3c) — uses cached project_id/metadata from SearchResult
+            // Cross-project flag
             if let Some(ref current_pid) = ctx.project_id
                 && let Some(ref item_pid) = r.project_id
                 && item_pid != current_pid
             {
                 obj["cross_project"] = json!(true);
-                if let Some(ref meta) = r.metadata
-                    && let Some(prov) = meta.get("_provenance")
-                    && let Some(pp) = prov.get("project_path")
-                {
-                    obj["project_path"] = pp.clone();
-                }
             }
 
-            // Related IDs from graph (Phase 1d)
+            // Related IDs from graph
             if let Ok(neighbors) = graph.get_neighbors(&[r.id.as_str()], 0.5) {
                 let related: Vec<String> = neighbors.iter().map(|(id, _, _)| id.clone()).collect();
                 if !related.is_empty() {
@@ -1003,21 +691,6 @@ async fn execute_recall(
             }
         });
 
-        // Expired item cleanup
-        let db_path = ctx.db_path.clone();
-        let project_id = ctx.project_id.clone();
-        let embedder = ctx.embedder.clone();
-        spawn_logged("cleanup_expired", async move {
-            match Database::open_with_embedder(&db_path, project_id, embedder).await {
-                Ok(db) => {
-                    if let Err(e) = db.cleanup_expired().await {
-                        tracing::warn!("cleanup_expired failed: {}", e);
-                    }
-                }
-                Err(e) => tracing::warn!("cleanup_expired: failed to open db: {}", e),
-            }
-        });
-
         // Consolidation queue cleanup: purge old processed entries
         let access_db_path2 = ctx.access_db_path.clone();
         spawn_logged("consolidation_cleanup", async move {
@@ -1039,18 +712,13 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
     let params: ListParams =
         args.and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or(ListParams {
-                tags: None,
                 limit: None,
                 scope: None,
             });
 
     let limit = params.limit.unwrap_or(10).min(100);
 
-    let mut filters = ItemFilters::new();
-
-    if let Some(tags) = params.tags {
-        filters = filters.with_tags(tags);
-    }
+    let filters = ItemFilters::new();
 
     let scope = params
         .scope
@@ -1078,12 +746,6 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
                             "created": item.created_at.to_rfc3339(),
                         });
 
-                        if let Some(ref title) = item.title {
-                            obj["title"] = json!(title);
-                        }
-                        if !item.tags.is_empty() {
-                            obj["tags"] = json!(item.tags);
-                        }
                         if item.is_chunked {
                             obj["chunked"] = json!(true);
                         }
@@ -1163,94 +825,6 @@ async fn execute_forget(
         }
         Ok(false) => CallToolResult::error(format!("Item not found: {}", params.id)),
         Err(e) => sanitized_error("Failed to delete item", e),
-    }
-}
-
-async fn execute_connections(
-    db: &mut Database,
-    graph: &GraphStore,
-    ctx: &ServerContext,
-    args: Option<Value>,
-) -> CallToolResult {
-    let params: ConnectionsParams = match args {
-        Some(v) => match serde_json::from_value(v) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!("Parameter validation failed: {}", e);
-                return CallToolResult::error("Invalid parameters");
-            }
-        },
-        None => return CallToolResult::error("Missing parameters"),
-    };
-
-    // Verify item exists and belongs to the current project
-    match db.get_item(&params.id).await {
-        Ok(Some(item)) => {
-            if let Some(ref current_pid) = ctx.project_id
-                && let Some(ref item_pid) = item.project_id
-                && item_pid != current_pid
-            {
-                return CallToolResult::error(format!(
-                    "Cannot view connections for item {} from a different project",
-                    params.id
-                ));
-            }
-        }
-        Ok(None) => return CallToolResult::error(format!("Item not found: {}", params.id)),
-        Err(e) => return sanitized_error("Failed to get item", e),
-    }
-
-    match graph.get_full_connections(&params.id) {
-        Ok(connections) => {
-            // Batch fetch all connected items
-            let target_ids: Vec<&str> = connections.iter().map(|c| c.target_id.as_str()).collect();
-            let items = db.get_items_batch(&target_ids).await.unwrap_or_default();
-            let item_map: std::collections::HashMap<&str, &Item> =
-                items.iter().map(|item| (item.id.as_str(), item)).collect();
-
-            let mut conn_json: Vec<Value> = Vec::new();
-
-            for conn in &connections {
-                let mut obj = json!({
-                    "id": conn.target_id,
-                    "type": conn.rel_type,
-                    "strength": conn.strength,
-                });
-
-                if let Some(count) = conn.count {
-                    obj["count"] = json!(count);
-                }
-
-                // Add content preview from batch, but only if the connected item
-                // belongs to the same project (or is global). This prevents
-                // cross-project content leakage via graph edges.
-                if let Some(item) = item_map.get(conn.target_id.as_str()) {
-                    let same_project = match (&ctx.project_id, &item.project_id) {
-                        (Some(current), Some(item_pid)) => current == item_pid,
-                        (_, None) => true, // Global items are visible to all
-                        _ => false,
-                    };
-                    if same_project {
-                        obj["content_preview"] = json!(truncate(&item.content, 80));
-                    } else {
-                        obj["cross_project"] = json!(true);
-                    }
-                }
-
-                conn_json.push(obj);
-            }
-
-            let result = json!({
-                "item_id": params.id,
-                "connections": conn_json
-            });
-
-            CallToolResult::success(
-                serde_json::to_string_pretty(&result)
-                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e)),
-            )
-        }
-        Err(e) => sanitized_error("Failed to get connections", e),
     }
 }
 

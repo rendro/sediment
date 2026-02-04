@@ -6,7 +6,7 @@
 //!
 //! - **Embedded storage** - LanceDB-powered, directory-based, no server required
 //! - **Local embeddings** - Uses `all-MiniLM-L6-v2` locally, no API keys needed
-//! - **MCP-native** - 5 tools for seamless LLM integration
+//! - **MCP-native** - 4 tools for seamless LLM integration
 //! - **Project-aware** - Scoped memories with automatic project detection
 //! - **Auto-chunking** - Long content is automatically chunked for better search
 

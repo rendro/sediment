@@ -80,18 +80,16 @@ pub struct DatabaseStats {
     pub chunk_count: usize,
 }
 
+/// Current schema version. Increment when making breaking schema changes.
+const SCHEMA_VERSION: i32 = 2;
+
 // Arrow schema builders
 fn item_schema() -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, false),
-        Field::new("title", DataType::Utf8, true),
-        Field::new("tags", DataType::Utf8, true), // JSON array as string
-        Field::new("source", DataType::Utf8, true),
-        Field::new("metadata", DataType::Utf8, true), // JSON as string
         Field::new("project_id", DataType::Utf8, true),
         Field::new("is_chunked", DataType::Boolean, false),
-        Field::new("expires_at", DataType::Int64, true), // Unix timestamp
         Field::new("created_at", DataType::Int64, false), // Unix timestamp
         Field::new(
             "vector",
@@ -194,7 +192,7 @@ impl Database {
         self.project_id.as_deref()
     }
 
-    /// Ensure all required tables exist
+    /// Ensure all required tables exist, migrating schema if needed
     async fn ensure_tables(&mut self) -> Result<()> {
         // Check for existing tables
         let table_names = self
@@ -203,6 +201,15 @@ impl Database {
             .execute()
             .await
             .map_err(|e| SedimentError::Database(format!("Failed to list tables: {}", e)))?;
+
+        // Check if migration is needed (items table exists but has old schema)
+        if table_names.contains(&"items".to_string()) {
+            let needs_migration = self.check_needs_migration().await?;
+            if needs_migration {
+                info!("Migrating database schema to version {}", SCHEMA_VERSION);
+                self.migrate_schema().await?;
+            }
+        }
 
         // Items table
         if table_names.contains(&"items".to_string()) {
@@ -221,6 +228,138 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// Check if the database needs migration by checking for old schema columns
+    async fn check_needs_migration(&self) -> Result<bool> {
+        let table = self
+            .db
+            .open_table("items")
+            .execute()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Failed to open items for check: {}", e)))?;
+
+        let schema = table.schema().await.map_err(|e| {
+            SedimentError::Database(format!("Failed to get schema: {}", e))
+        })?;
+
+        // Old schema has 'tags' column, new schema doesn't
+        let has_tags = schema.fields().iter().any(|f| f.name() == "tags");
+        Ok(has_tags)
+    }
+
+    /// Migrate from old schema to new schema
+    async fn migrate_schema(&mut self) -> Result<()> {
+        info!("Starting schema migration...");
+
+        // Open old table
+        let old_table = self
+            .db
+            .open_table("items")
+            .execute()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Failed to open old items: {}", e)))?;
+
+        // Read all items from old table
+        let results = old_table
+            .query()
+            .execute()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Migration query failed: {}", e)))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Migration collect failed: {}", e)))?;
+
+        // Convert old items to new format
+        let mut new_batches = Vec::new();
+        for batch in &results {
+            let converted = self.convert_batch_to_new_schema(batch)?;
+            new_batches.push(converted);
+        }
+
+        let item_count: usize = new_batches.iter().map(|b| b.num_rows()).sum();
+        info!("Migrating {} items to new schema", item_count);
+
+        // Drop old table
+        self.db.drop_table("items").await.map_err(|e| {
+            SedimentError::Database(format!("Failed to drop old items table: {}", e))
+        })?;
+
+        // Create new table with new schema
+        let schema = Arc::new(item_schema());
+        let new_table = self
+            .db
+            .create_empty_table("items", schema.clone())
+            .execute()
+            .await
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to create new items table: {}", e))
+            })?;
+
+        // Insert migrated data
+        if !new_batches.is_empty() {
+            let batches =
+                RecordBatchIterator::new(new_batches.into_iter().map(Ok), schema);
+            new_table
+                .add(Box::new(batches))
+                .execute()
+                .await
+                .map_err(|e| {
+                    SedimentError::Database(format!("Failed to insert migrated items: {}", e))
+                })?;
+        }
+
+        info!("Schema migration completed successfully");
+        Ok(())
+    }
+
+    /// Convert a batch from old schema to new schema
+    fn convert_batch_to_new_schema(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let schema = Arc::new(item_schema());
+
+        // Extract columns from old batch (handle missing columns gracefully)
+        let id_col = batch
+            .column_by_name("id")
+            .ok_or_else(|| SedimentError::Database("Missing id column".to_string()))?
+            .clone();
+
+        let content_col = batch
+            .column_by_name("content")
+            .ok_or_else(|| SedimentError::Database("Missing content column".to_string()))?
+            .clone();
+
+        let project_id_col = batch
+            .column_by_name("project_id")
+            .ok_or_else(|| SedimentError::Database("Missing project_id column".to_string()))?
+            .clone();
+
+        let is_chunked_col = batch
+            .column_by_name("is_chunked")
+            .ok_or_else(|| SedimentError::Database("Missing is_chunked column".to_string()))?
+            .clone();
+
+        let created_at_col = batch
+            .column_by_name("created_at")
+            .ok_or_else(|| SedimentError::Database("Missing created_at column".to_string()))?
+            .clone();
+
+        let vector_col = batch
+            .column_by_name("vector")
+            .ok_or_else(|| SedimentError::Database("Missing vector column".to_string()))?
+            .clone();
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                id_col,
+                content_col,
+                project_id_col,
+                is_chunked_col,
+                created_at_col,
+                vector_col,
+            ],
+        )
+        .map_err(|e| SedimentError::Database(format!("Failed to create migrated batch: {}", e)))
     }
 
     /// Ensure vector indexes exist on tables with enough rows.
@@ -425,24 +564,12 @@ impl Database {
         let mut results_map: std::collections::HashMap<String, (SearchResult, f32)> =
             std::collections::HashMap::new();
 
-        // Search items table directly (for non-chunked items and chunked items by title)
+        // Search items table directly (for non-chunked items and chunked items)
         if let Some(table) = &self.items_table {
-            let mut filter_parts = Vec::new();
-
-            if !filters.include_expired {
-                let now = Utc::now().timestamp();
-                filter_parts.push(format!("(expires_at IS NULL OR expires_at > {})", now));
-            }
-
-            let mut query_builder = table
+            let query_builder = table
                 .vector_search(query_embedding.clone())
                 .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?
                 .limit(limit * 2);
-
-            if !filter_parts.is_empty() {
-                let filter_str = filter_parts.join(" AND ");
-                query_builder = query_builder.only_if(filter_str);
-            }
 
             let results = query_builder
                 .execute()
@@ -465,13 +592,6 @@ impl Database {
                     let similarity = 1.0 / (1.0 + distance);
 
                     if similarity < min_similarity {
-                        continue;
-                    }
-
-                    // Apply tag filter
-                    if let Some(ref filter_tags) = filters.tags
-                        && !filter_tags.iter().any(|t| item.tags.contains(t))
-                    {
                         continue;
                     }
 
@@ -541,13 +661,6 @@ impl Database {
             // Fetch parent items for chunk matches
             for (item_id, (excerpt, chunk_similarity)) in chunk_matches {
                 if let Some(item) = self.get_item(&item_id).await? {
-                    // Apply tag filter
-                    if let Some(ref filter_tags) = filters.tags
-                        && !filter_tags.iter().any(|t| item.tags.contains(t))
-                    {
-                        continue;
-                    }
-
                     // Apply project boosting
                     let boosted_similarity = boost_similarity(
                         chunk_similarity,
@@ -603,15 +716,10 @@ impl Database {
             None => return Ok(Vec::new()),
         };
 
-        // Build filter for non-expired items
-        let now = Utc::now().timestamp();
-        let filter = format!("(expires_at IS NULL OR expires_at > {})", now);
-
         let results = table
             .vector_search(embedding)
             .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?
             .limit(limit)
-            .only_if(filter)
             .execute()
             .await
             .map_err(|e| SedimentError::Database(format!("Search failed: {}", e)))?
@@ -654,7 +762,7 @@ impl Database {
     /// List items with optional filters
     pub async fn list_items(
         &mut self,
-        filters: ItemFilters,
+        _filters: ItemFilters,
         limit: Option<usize>,
         scope: crate::ListScope,
     ) -> Result<Vec<Item>> {
@@ -664,11 +772,6 @@ impl Database {
         };
 
         let mut filter_parts = Vec::new();
-
-        if !filters.include_expired {
-            let now = Utc::now().timestamp();
-            filter_parts.push(format!("(expires_at IS NULL OR expires_at > {})", now));
-        }
 
         // Apply scope filter
         match scope {
@@ -710,11 +813,6 @@ impl Database {
         let mut items = Vec::new();
         for batch in results {
             items.extend(batch_to_items(&batch)?);
-        }
-
-        // Apply tag filter
-        if let Some(ref filter_tags) = filters.tags {
-            items.retain(|item| filter_tags.iter().any(|t| item.tags.contains(t)));
         }
 
         Ok(items)
@@ -790,76 +888,6 @@ impl Database {
         Ok(items)
     }
 
-    /// Soft-delete an item by setting its expiration to a past timestamp.
-    /// The item remains in the database but is excluded from search results.
-    ///
-    /// Uses delete-then-insert because both rows share the same ID. If the
-    /// re-insert fails, retries up to 3 times to avoid data loss.
-    pub async fn expire_item(&self, id: &str, expires_at: chrono::DateTime<Utc>) -> Result<()> {
-        if !is_valid_id(id) {
-            return Err(SedimentError::Database("Invalid item ID".to_string()));
-        }
-        let table = match &self.items_table {
-            Some(t) => t,
-            None => return Err(SedimentError::Database("Items table not found".to_string())),
-        };
-
-        // Read the item first so we have a full copy for recovery
-        let original_item = self.get_item(id).await?;
-        let original_item = match original_item {
-            Some(i) => i,
-            None => return Err(SedimentError::Database(format!("Item not found: {}", id))),
-        };
-
-        let mut item = original_item.clone();
-        item.expires_at = Some(expires_at);
-
-        // Delete first, then re-insert with updated expires_at.
-        // We must delete-then-insert (not insert-then-delete) because both rows
-        // share the same id, so a delete filter on id would remove both.
-        table
-            .delete(&format!("id = '{}'", sanitize_sql_string(id)))
-            .await
-            .map_err(|e| SedimentError::Database(format!("Delete for expire failed: {}", e)))?;
-
-        // Re-insert with retries to prevent data loss if insert fails after delete
-        let mut last_err = None;
-        for attempt in 0..3 {
-            let batch = item_to_batch(&item)?;
-            let batches = RecordBatchIterator::new(vec![Ok(batch)], Arc::new(item_schema()));
-            match table.add(Box::new(batches)).execute().await {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    tracing::warn!(
-                        "Re-insert for expire failed (attempt {}/3): {}",
-                        attempt + 1,
-                        e
-                    );
-                    last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt)))
-                        .await;
-                }
-            }
-        }
-
-        // Emergency recovery: re-insert the original item to prevent data loss
-        tracing::error!("expire_item: re-insert failed after 3 attempts, attempting recovery");
-        let batch = item_to_batch(&original_item)?;
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], Arc::new(item_schema()));
-        if let Err(recovery_err) = table.add(Box::new(batches)).execute().await {
-            tracing::error!(
-                "expire_item: CRITICAL - recovery also failed, item {} may be lost: {}",
-                id,
-                recovery_err
-            );
-        }
-
-        Err(SedimentError::Database(format!(
-            "Re-insert for expire failed after 3 attempts: {}",
-            last_err.unwrap()
-        )))
-    }
-
     /// Delete an item and its chunks.
     /// Returns `true` if the item existed, `false` if it was not found.
     pub async fn delete_item(&self, id: &str) -> Result<bool> {
@@ -915,86 +943,6 @@ impl Database {
         Ok(stats)
     }
 
-    /// Delete items whose expires_at timestamp is in the past.
-    pub async fn cleanup_expired(&self) -> Result<usize> {
-        let table = match &self.items_table {
-            Some(t) => t,
-            None => return Ok(0),
-        };
-
-        let now = Utc::now().timestamp();
-        // now is a system-generated i64 timestamp, no string sanitization needed
-        let filter = format!("expires_at IS NOT NULL AND expires_at < {}", now);
-
-        // Count how many will be deleted
-        let count = table.count_rows(Some(filter.clone())).await.unwrap_or(0);
-
-        if count > 0 {
-            // First, find the IDs of expired items so we can clean up their chunks
-            if let Ok(expired_ids) = self.get_expired_item_ids(now).await
-                && let Some(ref chunks_table) = self.chunks_table
-            {
-                for item_id in &expired_ids {
-                    let chunk_filter = format!("item_id = '{}'", sanitize_sql_string(item_id));
-                    if let Err(e) = chunks_table.delete(&chunk_filter).await {
-                        tracing::warn!(
-                            "Failed to delete chunks for expired item {}: {}",
-                            item_id,
-                            e
-                        );
-                    }
-                }
-            }
-
-            table
-                .delete(&filter)
-                .await
-                .map_err(|e| SedimentError::Database(format!("Expired cleanup failed: {}", e)))?;
-
-            info!("Cleaned up {} expired items and their chunks", count);
-        }
-
-        Ok(count)
-    }
-
-    /// Get IDs of items that have expired (helper for cleanup)
-    async fn get_expired_item_ids(&self, now_ts: i64) -> Result<Vec<String>> {
-        let table = match &self.items_table {
-            Some(t) => t,
-            None => return Ok(vec![]),
-        };
-
-        let filter = format!("expires_at IS NOT NULL AND expires_at < {}", now_ts);
-        let results = table
-            .query()
-            .only_if(filter)
-            .select(lancedb::query::Select::Columns(vec!["id".to_string()]))
-            .execute()
-            .await
-            .map_err(|e| SedimentError::Database(format!("Query expired IDs failed: {}", e)))?;
-
-        let batches = results
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| SedimentError::Database(format!("Collect expired IDs failed: {}", e)))?;
-
-        let mut ids = Vec::new();
-        for batch in &batches {
-            if let Some(id_col) = batch.column_by_name("id") {
-                let id_array = match id_col.as_any().downcast_ref::<StringArray>() {
-                    Some(arr) => arr,
-                    None => continue, // Skip batch if column type is unexpected
-                };
-                for i in 0..id_array.len() {
-                    if !id_array.is_null(i) {
-                        ids.push(id_array.value(i).to_string());
-                    }
-                }
-            }
-        }
-
-        Ok(ids)
-    }
 }
 
 // ==================== Decay Scoring ====================
@@ -1113,13 +1061,8 @@ fn item_to_batch(item: &Item) -> Result<RecordBatch> {
 
     let id = StringArray::from(vec![item.id.as_str()]);
     let content = StringArray::from(vec![item.content.as_str()]);
-    let title = StringArray::from(vec![item.title.as_deref()]);
-    let tags = StringArray::from(vec![serde_json::to_string(&item.tags).ok()]);
-    let source = StringArray::from(vec![item.source.as_deref()]);
-    let metadata = StringArray::from(vec![item.metadata.as_ref().map(|m| m.to_string())]);
     let project_id = StringArray::from(vec![item.project_id.as_deref()]);
     let is_chunked = BooleanArray::from(vec![item.is_chunked]);
-    let expires_at = Int64Array::from(vec![item.expires_at.map(|t| t.timestamp())]);
     let created_at = Int64Array::from(vec![item.created_at.timestamp()]);
 
     let vector = create_embedding_array(&item.embedding)?;
@@ -1129,13 +1072,8 @@ fn item_to_batch(item: &Item) -> Result<RecordBatch> {
         vec![
             Arc::new(id),
             Arc::new(content),
-            Arc::new(title),
-            Arc::new(tags),
-            Arc::new(source),
-            Arc::new(metadata),
             Arc::new(project_id),
             Arc::new(is_chunked),
-            Arc::new(expires_at),
             Arc::new(created_at),
             Arc::new(vector),
         ],
@@ -1156,22 +1094,6 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
         .ok_or_else(|| SedimentError::Database("Missing content column".to_string()))?;
 
-    let title_col = batch
-        .column_by_name("title")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-    let tags_col = batch
-        .column_by_name("tags")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-    let source_col = batch
-        .column_by_name("source")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-    let metadata_col = batch
-        .column_by_name("metadata")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
     let project_id_col = batch
         .column_by_name("project_id")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -1179,10 +1101,6 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
     let is_chunked_col = batch
         .column_by_name("is_chunked")
         .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
-
-    let expires_at_col = batch
-        .column_by_name("expires_at")
-        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
     let created_at_col = batch
         .column_by_name("created_at")
@@ -1196,40 +1114,6 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
         let id = id_col.value(i).to_string();
         let content = content_col.value(i).to_string();
 
-        let title = title_col.and_then(|c| {
-            if c.is_null(i) {
-                None
-            } else {
-                Some(c.value(i).to_string())
-            }
-        });
-
-        let tags: Vec<String> = tags_col
-            .and_then(|c| {
-                if c.is_null(i) {
-                    None
-                } else {
-                    serde_json::from_str(c.value(i)).ok()
-                }
-            })
-            .unwrap_or_default();
-
-        let source = source_col.and_then(|c| {
-            if c.is_null(i) {
-                None
-            } else {
-                Some(c.value(i).to_string())
-            }
-        });
-
-        let metadata = metadata_col.and_then(|c| {
-            if c.is_null(i) {
-                None
-            } else {
-                serde_json::from_str(c.value(i)).ok()
-            }
-        });
-
         let project_id = project_id_col.and_then(|c| {
             if c.is_null(i) {
                 None
@@ -1239,18 +1123,6 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
         });
 
         let is_chunked = is_chunked_col.map(|c| c.value(i)).unwrap_or(false);
-
-        let expires_at = expires_at_col.and_then(|c| {
-            if c.is_null(i) {
-                None
-            } else {
-                Some(
-                    Utc.timestamp_opt(c.value(i), 0)
-                        .single()
-                        .unwrap_or_else(Utc::now),
-                )
-            }
-        });
 
         let created_at = created_at_col
             .map(|c| {
@@ -1274,13 +1146,8 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
             id,
             content,
             embedding,
-            title,
-            tags,
-            source,
-            metadata,
             project_id,
             is_chunked,
-            expires_at,
             created_at,
         };
 
@@ -1532,5 +1399,11 @@ mod tests {
         let long_content = "a".repeat(1001);
         let should_chunk = long_content.chars().count() > CHUNK_THRESHOLD;
         assert!(should_chunk, "1001 chars should exceed 1000-char threshold");
+    }
+
+    #[test]
+    fn test_schema_version() {
+        // Ensure schema version is set
+        assert!(SCHEMA_VERSION >= 2, "Schema version should be at least 2");
     }
 }

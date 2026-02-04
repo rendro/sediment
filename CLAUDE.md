@@ -52,12 +52,12 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 
 - **`mod.rs`** - Module exports
 - **`server.rs`** - stdio JSON-RPC server with shared embedder, graph path, consolidation semaphore
-- **`tools.rs`** - 5 MCP tools: `store`, `recall`, `list`, `forget`, `connections`
+- **`tools.rs`** - 4 MCP tools: `store`, `recall`, `list`, `forget`
 - **`protocol.rs`** - MCP protocol types and JSON-RPC handling
 
 ### Data Flow
 
-1. **Store**: Content → Embedder (384-dim vector) → LanceDB storage → Graph node creation → Provenance metadata injection → Conflict detection → Consolidation queue → Auto-tag inference
+1. **Store**: Content → Embedder (384-dim vector) → LanceDB storage → Graph node creation → Conflict detection → Consolidation queue
 2. **Chunking**: Long content (>1000 chars) → Type-aware splitting → Individual chunk embeddings
 3. **Recall**: Query → Embedder → Vector similarity search → Project boosting → Decay scoring → Trust-weighted re-ranking → Graph backfill → 1-hop graph expansion → Co-access suggestions → Cross-project flagging → Background consolidation + co-access recording
 4. **Consolidation** (background): Queue candidates → >=0.95 similarity: merge (delete old, transfer edges, SUPERSEDES edge) → 0.85-0.95: link (RELATED edge)
@@ -74,32 +74,36 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 - **Memory decay scoring**: Recall results re-ranked using freshness (30-day half-life) and access frequency (log-scaled). Tracked in SQLite sidecar since LanceDB is append-oriented.
 - **Trust-weighted scoring**: `final_score = similarity * freshness * frequency * trust_bonus` where `trust_bonus = 1.0 + 0.05*ln(1+validation_count) + 0.02*edge_count`
 - **Non-blocking intelligence**: All background tasks (consolidation, co-access tracking, clustering) run as fire-and-forget `tokio::spawn` tasks. Tool responses return immediately. `Semaphore(1)` prevents concurrent consolidation.
-- **Auto-provenance**: Every store injects `metadata._provenance` with version, project_path, and supersedes chain
 - **Lazy graph backfill**: Pre-existing items get graph nodes when they appear in recall results
-- **Auto-tagging**: Items stored without tags inherit `auto:` prefixed tags from 2+ similar items sharing the same tag
+- **Auto-migration**: Database schema is automatically migrated on startup when upgrading from older versions
 
 ## MCP Tools Reference
 
-The 5-tool API is defined in `src/mcp/tools.rs`:
+The 4-tool API is defined in `src/mcp/tools.rs`:
 
 | Tool | Purpose |
 |------|---------|
-| `store` | Store content with optional title, tags, metadata, expiration, scope, replace, related |
-| `recall` | Semantic search with decay scoring, trust weighting, graph expansion, co-access suggestions, cross-project flagging |
-| `list` | List items by scope (project/global/all) with tag filtering |
+| `store` | Store content with optional scope (project/global) |
+| `recall` | Semantic search with decay scoring, trust weighting, graph expansion |
+| `list` | List items by scope (project/global/all) |
 | `forget` | Delete item by ID (removes from LanceDB and graph) |
-| `connections` | Show full relationship graph for an item (RELATED, SUPERSEDES, CO_ACCESSED edges with content previews) |
 
 ### Store Parameters
-- `content` (required), `title`, `tags`, `source`, `metadata`, `expires_at`, `scope` (project/global), `replace` (atomically replace item by ID), `related` (array of item IDs to link in graph)
+- `content` (required) — The content to store
+- `scope` (optional, default: "project") — Where to store: "project" or "global"
+
+### Recall Parameters
+- `query` (required) — Semantic search query
+- `limit` (optional, default: 5) — Maximum number of results
+
+### List Parameters
+- `limit` (optional, default: 10) — Maximum number of results
+- `scope` (optional, default: "project") — Which items to list: "project", "global", or "all"
 
 ### Recall Response Fields
-- `results[]` — standard results with `similarity`, `related_ids`, optional `cross_project` + `project_path` flags
+- `results[]` — standard results with `similarity`, `related_ids`, optional `cross_project` flag
 - `graph_expanded[]` — 1-hop neighbors from graph not in original results (marked `graph_expanded: true`)
 - `suggested[]` — items frequently co-recalled with top results (co-access count >= 3)
-
-### Connections Response
-- `item_id`, `connections[]` — each with `id`, `type` (related/supersedes/co_accessed), `strength`, optional `count`, `content_preview`
 
 ## SQLite Schema (access.db)
 

@@ -314,20 +314,11 @@ fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
         println!("Stored items ({}):\n", items.len());
 
         for item in items {
-            let title = item.title.as_deref().unwrap_or("(untitled)");
             let scope = if item.project_id.is_some() {
                 "project"
             } else {
                 "global"
             };
-            let tags = if item.tags.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", item.tags.join(", "))
-            };
-
-            println!("  {} ({}){}", title, scope, tags);
-            println!("    ID: {}", item.id);
 
             // Show truncated content
             let content_preview: String = item
@@ -341,7 +332,9 @@ fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
             } else {
                 ""
             };
-            println!("    Content: {}{}", content_preview, ellipsis);
+
+            println!("  {} ({})", item.id, scope);
+            println!("    {}{}", content_preview, ellipsis);
             println!();
         }
 
@@ -355,13 +348,12 @@ fn generate_claude_md_instructions() -> String {
 
 Use the Sediment MCP tools for persistent memory storage.
 
-## Tools (5 total)
+## Tools (4 total)
 
 - `mcp__sediment__store` - Store content for later retrieval
 - `mcp__sediment__recall` - Search by semantic similarity
 - `mcp__sediment__list` - List stored items
 - `mcp__sediment__forget` - Delete an item by ID
-- `mcp__sediment__connections` - Show relationship graph for an item
 
 ## When to Store
 
@@ -374,12 +366,12 @@ Use the Sediment MCP tools for persistent memory storage.
 
 Store a preference:
 ```json
-{"content": "User prefers dark mode", "tags": ["preference"]}
+{"content": "User prefers dark mode"}
 ```
 
 Store a document (auto-chunked if long):
 ```json
-{"content": "<long content>", "title": "API Reference", "tags": ["docs"]}
+{"content": "<long content>", "scope": "global"}
 ```
 
 Search:

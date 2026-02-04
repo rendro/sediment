@@ -315,21 +315,12 @@ async fn process_candidate(
                     tracing::warn!("add_related_edge failed: {}", e);
                 }
 
-                // Soft-delete: mark item as expired instead of hard-deleting.
-                // This allows recovery; expired items are excluded from search
-                // results by default but remain in the database.
-                let past = chrono::Utc::now() - chrono::Duration::seconds(1);
-                if let Err(e) = db.expire_item(&remove.id, past).await {
-                    // expire_item is delete-then-insert, so a failure may mean the
-                    // item was already deleted. Only attempt hard delete if the item
-                    // still exists to avoid double-deleting.
-                    warn!("expire_item failed ({}), checking if item still exists", e);
-                    if let Ok(Some(_)) = db.get_item(&remove.id).await {
-                        db.delete_item(&remove.id).await?;
-                        if let Err(e2) = graph.remove_node(&remove.id) {
-                            tracing::warn!("remove_node failed: {}", e2);
-                        }
-                    }
+                // Delete the duplicate item
+                if let Err(e) = db.delete_item(&remove.id).await {
+                    warn!("delete_item failed: {}", e);
+                }
+                if let Err(e) = graph.remove_node(&remove.id) {
+                    tracing::warn!("remove_node failed: {}", e);
                 }
 
                 Ok("merged".to_string())

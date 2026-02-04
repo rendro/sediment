@@ -12,7 +12,7 @@ Combines vector search, a relationship graph, and access tracking into a unified
 
 - **Single binary, zero config** — no Docker, no Postgres, no Qdrant. Just `sediment`.
 - **Sub-16ms recall** — local embeddings and vector search at 100 items, no network round-trips.
-- **5-tool focused API** — `store`, `recall`, `list`, `forget`, `connections`. That's it.
+- **4-tool focused API** — `store`, `recall`, `list`, `forget`. That's it.
 - **Works everywhere** — macOS (Intel + ARM), Linux x86_64. All data stays on your machine.
 
 ### Comparison
@@ -21,7 +21,7 @@ Combines vector search, a relationship graph, and access tracking into a unified
 |---|---|---|---|
 | Install | Single binary | Docker + Postgres + Qdrant | Python + pip |
 | Dependencies | None | 3 services | Python runtime + deps |
-| Tools | 5 | 10+ | 24 |
+| Tools | 4 | 10+ | 24 |
 | Embeddings | Local (all-MiniLM-L6-v2) | API-dependent | API-dependent |
 | Graph features | Built-in | No | No |
 | Memory decay | Built-in | No | No |
@@ -131,13 +131,12 @@ Go to **Settings > Tools > AI Assistant > MCP Servers**, click **+**, and add:
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `store` | Save content with optional title, tags, source, metadata, expiration, scope, replace, and related item links |
-| `recall` | Search memories by semantic similarity with decay scoring, trust weighting, graph expansion, and co-access suggestions |
-| `list` | List stored items by scope (project/global/all) with tag filtering |
-| `forget` | Delete an item by ID (removes from vector store and graph) |
-| `connections` | Show relationship graph for an item (related, supersedes, co-accessed edges) |
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `store` | `content`, `scope?` | Save content to memory |
+| `recall` | `query`, `limit?` | Search by semantic similarity |
+| `list` | `limit?`, `scope?` | List stored items |
+| `forget` | `id` | Delete an item by ID |
 
 ## CLI
 
@@ -164,19 +163,19 @@ All local, embedded, zero config:
 - **Project scoping**: Automatic context isolation between projects. Same-project items get a similarity boost.
 - **Relationship graph**: Items linked via RELATED, SUPERSEDES, and CO_ACCESSED edges. Recall expands results with 1-hop graph neighbors and co-access suggestions.
 - **Background consolidation**: Near-duplicates (≥0.95 similarity) auto-merged; similar items (0.85–0.95) linked.
-- **Auto-tagging**: Items without tags inherit tags from similar existing items.
 - **Type-aware chunking**: Intelligent splitting for markdown, code, JSON, YAML, and plain text.
 - **Conflict detection**: Items with ≥0.85 similarity flagged on store.
-- **Cross-project recall**: Results from other projects flagged with provenance metadata.
+- **Cross-project recall**: Results from other projects flagged.
 - **Local embeddings**: all-MiniLM-L6-v2 via Candle (384-dim vectors, no API keys).
 - **Model integrity**: SHA-256 verification of all model files on every load, pinned to a specific revision.
+- **Auto-migration**: Database schema automatically migrated when upgrading from older versions.
 
 ### Security
 
-- **Input bounds**: Content (1MB), queries (100KB), JSON-RPC lines (10MB), tags (50×200B), metadata (100KB).
-- **Rate limiting**: 60 tool calls per minute.
+- **Input bounds**: Content (1MB), queries (10KB), JSON-RPC lines (10MB).
+- **Rate limiting**: 600 tool calls per minute.
 - **SQL injection prevention**: Sanitized filter expressions for LanceDB; parameterized queries for SQLite.
-- **Cross-project access control**: Replace, forget, and connections enforce project isolation. Cross-project content is redacted in recall results.
+- **Cross-project access control**: Forget enforces project isolation. Cross-project content is flagged in recall results.
 - **Error sanitization**: Internal errors logged to stderr; only generic messages returned to MCP clients.
 - **Retry with backoff**: Transient failures retried with exponential backoff (3 attempts, 100ms–2s).
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.0] - 2026-02-03
+
+### Changed
+- **BREAKING**: Simplified API from 5 tools to 4 tools (removed `connections`)
+- **BREAKING**: Simplified `store` from 9 parameters to 2 (`content`, `scope`)
+- **BREAKING**: Simplified `recall` from 4 parameters to 2 (`query`, `limit`)
+- **BREAKING**: Simplified `list` from 3 parameters to 2 (`limit`, `scope`)
+- **BREAKING**: Removed fields from Item: `title`, `tags`, `source`, `metadata`, `expires_at`
+
+### Added
+- Auto-migration: existing databases automatically migrated to new schema on startup
+- Schema versioning for future migrations
+
+### Removed
+- `connections` tool (graph is now internal infrastructure)
+- Tag-based filtering (semantic search handles categorization)
+- Item expiration (simplified lifecycle)
+- Replace functionality (use `forget` + `store`)
+- Related item linking on store (handled by auto-consolidation)
+
 ## [0.2.3] - 2026-02-03
 
 ### Added
