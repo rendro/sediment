@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.1] - 2026-02-04
+
+### Changed
+- Optimized CLAUDE.md instructions for proactive tool usage
+
 ## [0.3.0] - 2026-02-03
 
 ### Changed
