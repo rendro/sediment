@@ -232,16 +232,14 @@ impl Database {
 
     /// Check if the database needs migration by checking for old schema columns
     async fn check_needs_migration(&self) -> Result<bool> {
-        let table = self
-            .db
-            .open_table("items")
-            .execute()
-            .await
-            .map_err(|e| SedimentError::Database(format!("Failed to open items for check: {}", e)))?;
-
-        let schema = table.schema().await.map_err(|e| {
-            SedimentError::Database(format!("Failed to get schema: {}", e))
+        let table = self.db.open_table("items").execute().await.map_err(|e| {
+            SedimentError::Database(format!("Failed to open items for check: {}", e))
         })?;
+
+        let schema = table
+            .schema()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Failed to get schema: {}", e)))?;
 
         // Old schema has 'tags' column, new schema doesn't
         let has_tags = schema.fields().iter().any(|f| f.name() == "tags");
@@ -298,8 +296,7 @@ impl Database {
 
         // Insert migrated data
         if !new_batches.is_empty() {
-            let batches =
-                RecordBatchIterator::new(new_batches.into_iter().map(Ok), schema);
+            let batches = RecordBatchIterator::new(new_batches.into_iter().map(Ok), schema);
             new_table
                 .add(Box::new(batches))
                 .execute()
@@ -942,7 +939,6 @@ impl Database {
 
         Ok(stats)
     }
-
 }
 
 // ==================== Decay Scoring ====================
@@ -1404,6 +1400,7 @@ mod tests {
     #[test]
     fn test_schema_version() {
         // Ensure schema version is set
-        assert!(SCHEMA_VERSION >= 2, "Schema version should be at least 2");
+        let version = SCHEMA_VERSION;
+        assert!(version >= 2, "Schema version should be at least 2");
     }
 }

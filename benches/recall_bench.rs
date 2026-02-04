@@ -101,9 +101,7 @@ async fn seed_database(n: usize, embedder: Arc<Embedder>) -> SeededDb {
 
     for i in 0..n {
         let content = generate_content(i);
-        let item = Item::new(&content)
-            .with_tags(vec![format!("bench-tag-{}", i % 5)])
-            .with_project_id("bench-project");
+        let item = Item::new(&content).with_project_id("bench-project");
 
         let result = db.store_item(item).await.expect("store item");
         let id = result.id.clone();
@@ -174,7 +172,7 @@ fn recall_benchmarks(c: &mut Criterion) {
                                 enable_decay_scoring: false,
                                 enable_background_tasks: false,
                             };
-                            let filters = ItemFilters::new().with_min_similarity(0.3);
+                            let filters = ItemFilters::new();
                             let _ = recall_pipeline(
                                 &mut db, &tracker, &graph, query, 5, filters, &config,
                             )
@@ -210,7 +208,7 @@ fn recall_benchmarks(c: &mut Criterion) {
                             let tracker = AccessTracker::open(&access_path).unwrap();
                             let graph = GraphStore::open(&access_path).unwrap();
                             let config = RecallConfig::default();
-                            let filters = ItemFilters::new().with_min_similarity(0.3);
+                            let filters = ItemFilters::new();
                             let _ = recall_pipeline(
                                 &mut db, &tracker, &graph, query, 5, filters, &config,
                             )
