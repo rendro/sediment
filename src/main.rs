@@ -87,8 +87,11 @@ fn run_mcp_server(db_override: Option<PathBuf>) -> Result<()> {
     let db_path = db_override.unwrap_or_else(sediment::central_db_path);
 
     // Auto-detect project context from current directory
+    // If no .git or .sediment marker found, use cwd as project root
     let cwd = std::env::current_dir().ok();
-    let project_root = cwd.as_deref().and_then(sediment::find_project_root);
+    let project_root = cwd
+        .as_deref()
+        .map(|dir| sediment::find_project_root(dir).unwrap_or_else(|| dir.to_path_buf()));
     let project_id = project_root
         .as_ref()
         .and_then(|root| sediment::get_or_create_project_id(root).ok());
