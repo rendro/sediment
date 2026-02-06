@@ -96,6 +96,41 @@ fn run_mcp_server(db_override: Option<PathBuf>) -> Result<()> {
         .as_ref()
         .and_then(|root| sediment::get_or_create_project_id(root).ok());
 
+    // Check for pending project ID migration (UUID → git hash)
+    if let Some(ref root) = project_root {
+        if let Some(old_id) = sediment::pending_migration(root) {
+            if let Some(ref new_id) = project_id {
+                tracing::info!(
+                    "Migrating project ID: {} → {}",
+                    old_id,
+                    new_id
+                );
+
+                // Migrate LanceDB items
+                let rt = tokio::runtime::Runtime::new()?;
+                if let Err(e) =
+                    rt.block_on(sediment::db::migrate_project_id(&db_path, &old_id, new_id))
+                {
+                    tracing::warn!("Failed to migrate LanceDB items: {}", e);
+                }
+
+                // Migrate graph nodes
+                let sediment_dir = db_path.parent().unwrap_or(&db_path);
+                let access_db_path = sediment_dir.join("access.db");
+                if let Ok(graph) = sediment::graph::GraphStore::open(&access_db_path) {
+                    if let Err(e) = graph.migrate_project_id(&old_id, new_id) {
+                        tracing::warn!("Failed to migrate graph nodes: {}", e);
+                    }
+                }
+
+                // Clear migration marker
+                if let Err(e) = sediment::clear_migration_marker(root) {
+                    tracing::warn!("Failed to clear migration marker: {}", e);
+                }
+            }
+        }
+    }
+
     tracing::info!("Starting Sediment MCP server");
     tracing::info!("Database: {:?}", db_path);
 

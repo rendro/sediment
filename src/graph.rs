@@ -594,6 +594,26 @@ impl GraphStore {
         Ok(map)
     }
 
+    /// Migrate all graph nodes from one project ID to another.
+    ///
+    /// Used when a project's ID changes (e.g., UUID→git root commit hash).
+    pub fn migrate_project_id(&self, old_id: &str, new_id: &str) -> Result<usize> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE graph_nodes SET project_id = ?1 WHERE project_id = ?2",
+                params![new_id, old_id],
+            )
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to migrate graph nodes: {}", e))
+            })?;
+
+        if updated > 0 {
+            debug!("Migrated {} graph nodes from project {} to {}", updated, old_id, new_id);
+        }
+        Ok(updated)
+    }
+
     /// Get the edge count for an item (total number of edges of all types).
     pub fn get_edge_count(&self, item_id: &str) -> Result<u32> {
         let count: i64 = self

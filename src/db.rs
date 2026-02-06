@@ -1168,6 +1168,63 @@ impl Database {
     }
 }
 
+// ==================== Project ID Migration ====================
+
+/// Migrate all LanceDB items from one project ID to another.
+///
+/// Used when a project's ID changes (e.g., UUID→git root commit hash).
+/// Updates the `project_id` column in-place on both items and chunks tables.
+pub async fn migrate_project_id(
+    db_path: &std::path::Path,
+    old_id: &str,
+    new_id: &str,
+) -> Result<u64> {
+    if !is_valid_id(old_id) || !is_valid_id(new_id) {
+        return Err(SedimentError::Database(
+            "Invalid project ID for migration".to_string(),
+        ));
+    }
+
+    let db = connect(db_path.to_str().ok_or_else(|| {
+        SedimentError::Database("Database path contains invalid UTF-8".to_string())
+    })?)
+    .execute()
+    .await
+    .map_err(|e| SedimentError::Database(format!("Failed to connect for migration: {}", e)))?;
+
+    let table_names = db
+        .table_names()
+        .execute()
+        .await
+        .map_err(|e| SedimentError::Database(format!("Failed to list tables: {}", e)))?;
+
+    let mut total_updated = 0u64;
+
+    if table_names.contains(&"items".to_string()) {
+        let table = db.open_table("items").execute().await.map_err(|e| {
+            SedimentError::Database(format!("Failed to open items table: {}", e))
+        })?;
+
+        let updated = table
+            .update()
+            .only_if(format!(
+                "project_id = '{}'",
+                sanitize_sql_string(old_id)
+            ))
+            .column("project_id", format!("'{}'", sanitize_sql_string(new_id)))
+            .execute()
+            .await
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to migrate items: {}", e))
+            })?;
+
+        total_updated += updated;
+        info!("Migrated {} items from project {} to {}", updated, old_id, new_id);
+    }
+
+    Ok(total_updated)
+}
+
 // ==================== Decay Scoring ====================
 
 /// Compute a decay-adjusted score for a search result.

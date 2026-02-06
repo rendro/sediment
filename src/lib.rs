@@ -137,6 +137,9 @@ pub struct ProjectConfig {
     /// How the project ID was derived: "git-root-commit" or "uuid"
     #[serde(default = "default_source")]
     pub source: String,
+    /// Set during UUID→git migration; cleared after LanceDB items are updated
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrated_from: Option<String>,
 }
 
 fn default_source() -> String {
@@ -148,6 +151,26 @@ fn default_source() -> String {
 /// Returns `Ok(Some(hash))` if the project root is inside a git repo with at least one commit.
 /// Returns `Ok(None)` if git is not installed, the directory is not a git repo, or there are no commits.
 pub fn derive_git_root_commit(project_root: &Path) -> std::io::Result<Option<String>> {
+    // Check for shallow clone — root commit in shallow history is not the true root
+    let shallow_check = match Command::new("git")
+        .args(["rev-parse", "--is-shallow-repository"])
+        .current_dir(project_root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    if shallow_check.status.success() {
+        let stdout = String::from_utf8_lossy(&shallow_check.stdout);
+        if stdout.trim() == "true" {
+            return Ok(None);
+        }
+    }
+
     let output = match Command::new("git")
         .args(["rev-list", "--max-parents=0", "HEAD"])
         .current_dir(project_root)
@@ -201,6 +224,7 @@ pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> 
                 let new_config = ProjectConfig {
                     project_id: git_hash.clone(),
                     source: "git-root-commit".to_string(),
+                    migrated_from: Some(config.project_id),
                 };
                 write_config_atomic(&sediment_dir, &config_path, &new_config)?;
                 return Ok(git_hash);
@@ -218,11 +242,13 @@ pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> 
         ProjectConfig {
             project_id: git_hash,
             source: "git-root-commit".to_string(),
+            migrated_from: None,
         }
     } else {
         ProjectConfig {
             project_id: Uuid::new_v4().to_string(),
             source: "uuid".to_string(),
+            migrated_from: None,
         }
     };
 
@@ -251,6 +277,32 @@ fn write_config_atomic(
     if let Err(e) = std::fs::rename(&tmp_path, config_path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
+    }
+    Ok(())
+}
+
+/// Check if a project ID migration is pending (UUID→git hash).
+///
+/// Returns the old project ID if a migration was started but LanceDB items
+/// have not yet been updated.
+pub fn pending_migration(project_root: &Path) -> Option<String> {
+    let config_path = project_root.join(".sediment").join("config");
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    let config: ProjectConfig = serde_json::from_str(&content).ok()?;
+    config.migrated_from
+}
+
+/// Clear the migration marker after LanceDB items have been updated.
+pub fn clear_migration_marker(project_root: &Path) -> std::io::Result<()> {
+    let sediment_dir = project_root.join(".sediment");
+    let config_path = sediment_dir.join("config");
+
+    let content = std::fs::read_to_string(&config_path)?;
+    if let Ok(mut config) = serde_json::from_str::<ProjectConfig>(&content) {
+        if config.migrated_from.is_some() {
+            config.migrated_from = None;
+            write_config_atomic(&sediment_dir, &config_path, &config)?;
+        }
     }
     Ok(())
 }
@@ -445,9 +497,89 @@ mod tests {
         let git_hash = derive_git_root_commit(dir).unwrap().unwrap();
         assert_eq!(project_id, git_hash, "Should migrate to git hash");
 
-        // Config should now have git-root-commit source
+        // Config should now have git-root-commit source with migrated_from
         let config_content = std::fs::read_to_string(sediment_dir.join("config")).unwrap();
         let config: ProjectConfig = serde_json::from_str(&config_content).unwrap();
         assert_eq!(config.source, "git-root-commit");
+        assert_eq!(config.migrated_from.as_deref(), Some(old_uuid));
+
+        // pending_migration should return the old UUID
+        assert_eq!(pending_migration(dir), Some(old_uuid.to_string()));
+
+        // clear_migration_marker should remove it
+        clear_migration_marker(dir).unwrap();
+        assert_eq!(pending_migration(dir), None);
+    }
+
+    #[test]
+    #[ignore] // requires git
+    fn test_git_root_commit_fast_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create git repo with commit
+        Command::new("git").args(["init"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["config", "user.name", "Test"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["commit", "--allow-empty", "-m", "init"]).current_dir(dir).output().unwrap();
+
+        // First call creates config with git-root-commit source
+        let id1 = get_or_create_project_id(dir).unwrap();
+
+        // Second call should return immediately (fast path) without re-deriving
+        let id2 = get_or_create_project_id(dir).unwrap();
+        assert_eq!(id1, id2, "Fast path should return same ID");
+
+        // Verify config has git-root-commit source
+        let config_content = std::fs::read_to_string(dir.join(".sediment/config")).unwrap();
+        let config: ProjectConfig = serde_json::from_str(&config_content).unwrap();
+        assert_eq!(config.source, "git-root-commit");
+        assert!(config.migrated_from.is_none(), "No migration on fresh git config");
+    }
+
+    #[test]
+    fn test_uuid_retained_when_git_unavailable() {
+        // Non-git directory: UUID config should be created and retained
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let id1 = get_or_create_project_id(dir).unwrap();
+
+        // Verify it's a UUID with source "uuid"
+        let config_content = std::fs::read_to_string(dir.join(".sediment/config")).unwrap();
+        let config: ProjectConfig = serde_json::from_str(&config_content).unwrap();
+        assert_eq!(config.source, "uuid");
+        assert!(config.migrated_from.is_none());
+
+        // Second call should return the same UUID
+        let id2 = get_or_create_project_id(dir).unwrap();
+        assert_eq!(id1, id2, "UUID should be retained on repeated calls");
+    }
+
+    #[test]
+    #[ignore] // requires git
+    fn test_shallow_clone_falls_back_to_uuid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let origin_dir = tmp.path().join("origin");
+        let shallow_dir = tmp.path().join("shallow");
+        std::fs::create_dir_all(&origin_dir).unwrap();
+
+        // Create origin repo with a commit
+        Command::new("git").args(["init"]).current_dir(&origin_dir).output().unwrap();
+        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(&origin_dir).output().unwrap();
+        Command::new("git").args(["config", "user.name", "Test"]).current_dir(&origin_dir).output().unwrap();
+        Command::new("git").args(["commit", "--allow-empty", "-m", "init"]).current_dir(&origin_dir).output().unwrap();
+        Command::new("git").args(["commit", "--allow-empty", "-m", "second"]).current_dir(&origin_dir).output().unwrap();
+
+        // Shallow clone (file:// protocol required for local shallow clones)
+        let origin_url = format!("file://{}", origin_dir.display());
+        Command::new("git")
+            .args(["clone", "--depth=1", &origin_url, shallow_dir.to_str().unwrap()])
+            .output()
+            .unwrap();
+
+        // derive_git_root_commit should return None for shallow clone
+        let result = derive_git_root_commit(&shallow_dir).unwrap();
+        assert!(result.is_none(), "Shallow clone should return None");
     }
 }
