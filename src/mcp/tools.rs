@@ -399,6 +399,8 @@ pub async fn recall_pipeline(
     if config.enable_decay_scoring {
         let item_ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         let access_records = tracker.get_accesses(&item_ids).unwrap_or_default();
+        let validation_counts = tracker.get_validation_counts(&item_ids).unwrap_or_default();
+        let edge_counts = graph.get_edge_counts(&item_ids).unwrap_or_default();
         let now = chrono::Utc::now().timestamp();
 
         for result in &mut results {
@@ -418,8 +420,8 @@ pub async fn recall_pipeline(
                 last_accessed,
             );
 
-            let validation_count = tracker.get_validation_count(&result.id).unwrap_or(0);
-            let edge_count = graph.get_edge_count(&result.id).unwrap_or(0);
+            let validation_count = validation_counts.get(&result.id).copied().unwrap_or(0);
+            let edge_count = edge_counts.get(&result.id).copied().unwrap_or(0);
             let trust_bonus =
                 1.0 + 0.05 * (1.0 + validation_count as f64).ln() as f32 + 0.02 * edge_count as f32;
 
@@ -586,6 +588,12 @@ async fn execute_recall(
 
     let results = &recall_result.results;
 
+    // Batch-fetch neighbors for all result IDs
+    let all_result_ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+    let neighbors_map = graph
+        .get_neighbors_mapped(&all_result_ids, 0.5)
+        .unwrap_or_default();
+
     let formatted: Vec<Value> = results
         .iter()
         .map(|r| {
@@ -615,9 +623,8 @@ async fn execute_recall(
                 obj["cross_project"] = json!(true);
             }
 
-            // Related IDs from graph
-            if let Ok(neighbors) = graph.get_neighbors(&[r.id.as_str()], 0.5) {
-                let related: Vec<String> = neighbors.iter().map(|(id, _, _)| id.clone()).collect();
+            // Related IDs from graph (batch lookup)
+            if let Some(related) = neighbors_map.get(&r.id) {
                 if !related.is_empty() {
                     obj["related_ids"] = json!(related);
                 }

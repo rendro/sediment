@@ -106,6 +106,51 @@ impl AccessTracker {
         Ok(count)
     }
 
+    /// Get validation counts for multiple items in a single query.
+    pub fn get_validation_counts(&self, item_ids: &[&str]) -> Result<HashMap<String, u32>> {
+        if item_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders: Vec<String> = item_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT item_id, COALESCE(validation_count, 0) FROM access_log WHERE item_id IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| SedimentError::Database(format!("Failed to prepare query: {}", e)))?;
+
+        let params: Vec<&dyn rusqlite::types::ToSql> = item_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to query validation counts: {}", e))
+            })?;
+
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, count) = row.map_err(|e| {
+                SedimentError::Database(format!("Failed to read validation count: {}", e))
+            })?;
+            map.insert(id, count);
+        }
+
+        Ok(map)
+    }
+
     /// Get access records for a batch of item IDs.
     pub fn get_accesses(&self, item_ids: &[&str]) -> Result<HashMap<String, AccessRecord>> {
         if item_ids.is_empty() {
@@ -218,5 +263,32 @@ mod tests {
         // Item that was never validated should have 0
         let count = tracker.get_validation_count("other-item").unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_get_validation_counts() {
+        let tmp = NamedTempFile::new().unwrap();
+        let tracker = AccessTracker::open(tmp.path()).unwrap();
+
+        let created = 1700000000i64;
+        tracker.record_validation("item-a", created).unwrap();
+        tracker.record_validation("item-a", created).unwrap();
+        tracker.record_validation("item-b", created).unwrap();
+
+        let counts = tracker
+            .get_validation_counts(&["item-a", "item-b", "item-c"])
+            .unwrap();
+
+        // Batch results should match individual lookups
+        assert_eq!(counts.get("item-a").copied().unwrap_or(0), 2);
+        assert_eq!(counts.get("item-b").copied().unwrap_or(0), 1);
+        // item-c has no record, should not be in map
+        assert!(!counts.contains_key("item-c"));
+
+        // Verify consistency with single-item method
+        assert_eq!(
+            counts.get("item-a").copied().unwrap_or(0),
+            tracker.get_validation_count("item-a").unwrap()
+        );
     }
 }

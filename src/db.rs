@@ -64,6 +64,10 @@ const CONFLICT_SEARCH_LIMIT: usize = 5;
 /// Cap at 200 to bound embedding time while covering most legitimate content.
 const MAX_CHUNKS_PER_ITEM: usize = 200;
 
+/// Maximum number of chunks to embed in a single model forward pass.
+/// Bounds peak memory usage while still batching efficiently.
+const EMBEDDING_BATCH_SIZE: usize = 32;
+
 /// Database wrapper for LanceDB
 pub struct Database {
     db: lancedb::Connection,
@@ -195,12 +199,25 @@ impl Database {
     /// Ensure all required tables exist, migrating schema if needed
     async fn ensure_tables(&mut self) -> Result<()> {
         // Check for existing tables
-        let table_names = self
+        let mut table_names = self
             .db
             .table_names()
             .execute()
             .await
             .map_err(|e| SedimentError::Database(format!("Failed to list tables: {}", e)))?;
+
+        // Recover from interrupted migration if staging table exists
+        if table_names.contains(&"items_migrated".to_string()) {
+            info!("Detected interrupted migration, recovering...");
+            self.recover_interrupted_migration(&table_names).await?;
+            // Re-fetch table names after recovery
+            table_names = self
+                .db
+                .table_names()
+                .execute()
+                .await
+                .map_err(|e| SedimentError::Database(format!("Failed to list tables: {}", e)))?;
+        }
 
         // Check if migration is needed (items table exists but has old schema)
         if table_names.contains(&"items".to_string()) {
@@ -246,11 +263,105 @@ impl Database {
         Ok(has_tags)
     }
 
-    /// Migrate from old schema to new schema
+    /// Recover from an interrupted migration.
+    ///
+    /// The staging table `items_migrated` indicates a migration was in progress.
+    /// We determine the state and recover:
+    /// - Case A: `items_migrated` exists, `items` does not → migration completed
+    ///   but cleanup didn't finish. Copy data to new `items`, drop staging.
+    /// - Case B: both exist, `items` has old schema (has `tags`) → migration never
+    ///   completed. Drop staging (old data is still intact), migration will re-run.
+    /// - Case C: both exist, `items` has new schema → migration completed but
+    ///   staging cleanup didn't finish. Just drop staging.
+    async fn recover_interrupted_migration(&mut self, table_names: &[String]) -> Result<()> {
+        let has_items = table_names.contains(&"items".to_string());
+
+        if !has_items {
+            // Case A: items was dropped, items_migrated has the data
+            info!("Recovery case A: restoring items from items_migrated");
+            let staging = self
+                .db
+                .open_table("items_migrated")
+                .execute()
+                .await
+                .map_err(|e| {
+                    SedimentError::Database(format!("Failed to open staging table: {}", e))
+                })?;
+
+            let results = staging
+                .query()
+                .execute()
+                .await
+                .map_err(|e| SedimentError::Database(format!("Recovery query failed: {}", e)))?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| SedimentError::Database(format!("Recovery collect failed: {}", e)))?;
+
+            let schema = Arc::new(item_schema());
+            let new_table = self
+                .db
+                .create_empty_table("items", schema.clone())
+                .execute()
+                .await
+                .map_err(|e| {
+                    SedimentError::Database(format!("Failed to create items table: {}", e))
+                })?;
+
+            if !results.is_empty() {
+                let batches = RecordBatchIterator::new(results.into_iter().map(Ok), schema);
+                new_table
+                    .add(Box::new(batches))
+                    .execute()
+                    .await
+                    .map_err(|e| {
+                        SedimentError::Database(format!("Failed to restore items: {}", e))
+                    })?;
+            }
+
+            self.db.drop_table("items_migrated").await.map_err(|e| {
+                SedimentError::Database(format!("Failed to drop staging table: {}", e))
+            })?;
+            info!("Recovery case A completed");
+        } else {
+            // Both exist — check if items has old or new schema
+            let has_old_schema = self.check_needs_migration().await?;
+
+            if has_old_schema {
+                // Case B: migration never completed, old data intact. Drop staging.
+                info!("Recovery case B: dropping incomplete staging table");
+                self.db.drop_table("items_migrated").await.map_err(|e| {
+                    SedimentError::Database(format!("Failed to drop staging table: {}", e))
+                })?;
+                // Migration will re-run in ensure_tables
+            } else {
+                // Case C: migration completed, just cleanup staging
+                info!("Recovery case C: dropping leftover staging table");
+                self.db.drop_table("items_migrated").await.map_err(|e| {
+                    SedimentError::Database(format!("Failed to drop staging table: {}", e))
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Migrate from old schema to new schema using atomic staging table pattern.
+    ///
+    /// Steps:
+    /// 1. Read all rows from old "items" table
+    /// 2. Convert to new schema
+    /// 3. Verify row counts match
+    /// 4. Create "items_migrated" staging table with new data
+    /// 5. Verify staging row count
+    /// 6. Drop old "items" (data safe in staging)
+    /// 7. Create new "items" from staging data
+    /// 8. Drop staging table
+    ///
+    /// If crash occurs at any point, `recover_interrupted_migration` handles it.
     async fn migrate_schema(&mut self) -> Result<()> {
         info!("Starting schema migration...");
 
-        // Open old table
+        // Step 1: Read all items from old table
         let old_table = self
             .db
             .open_table("items")
@@ -258,7 +369,6 @@ impl Database {
             .await
             .map_err(|e| SedimentError::Database(format!("Failed to open old items: {}", e)))?;
 
-        // Read all items from old table
         let results = old_table
             .query()
             .execute()
@@ -268,23 +378,88 @@ impl Database {
             .await
             .map_err(|e| SedimentError::Database(format!("Migration collect failed: {}", e)))?;
 
-        // Convert old items to new format
+        // Step 2: Convert to new format
         let mut new_batches = Vec::new();
         for batch in &results {
             let converted = self.convert_batch_to_new_schema(batch)?;
             new_batches.push(converted);
         }
 
-        let item_count: usize = new_batches.iter().map(|b| b.num_rows()).sum();
-        info!("Migrating {} items to new schema", item_count);
+        // Step 3: Verify row counts
+        let old_count: usize = results.iter().map(|b| b.num_rows()).sum();
+        let new_count: usize = new_batches.iter().map(|b| b.num_rows()).sum();
+        if old_count != new_count {
+            return Err(SedimentError::Database(format!(
+                "Migration row count mismatch: old={}, new={}",
+                old_count, new_count
+            )));
+        }
+        info!("Migrating {} items to new schema", old_count);
 
-        // Drop old table
+        // Step 4: Drop stale staging table if exists (from previous failed attempt)
+        let table_names = self
+            .db
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Failed to list tables: {}", e)))?;
+        if table_names.contains(&"items_migrated".to_string()) {
+            self.db.drop_table("items_migrated").await.map_err(|e| {
+                SedimentError::Database(format!("Failed to drop stale staging: {}", e))
+            })?;
+        }
+
+        // Step 5: Create staging table with migrated data
+        let schema = Arc::new(item_schema());
+        let staging_table = self
+            .db
+            .create_empty_table("items_migrated", schema.clone())
+            .execute()
+            .await
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to create staging table: {}", e))
+            })?;
+
+        if !new_batches.is_empty() {
+            let batches =
+                RecordBatchIterator::new(new_batches.into_iter().map(Ok), schema.clone());
+            staging_table
+                .add(Box::new(batches))
+                .execute()
+                .await
+                .map_err(|e| {
+                    SedimentError::Database(format!("Failed to insert into staging: {}", e))
+                })?;
+        }
+
+        // Step 6: Verify staging row count
+        let staging_count = staging_table.count_rows(None).await.map_err(|e| {
+            SedimentError::Database(format!("Failed to count staging rows: {}", e))
+        })?;
+        if staging_count != old_count {
+            // Staging is incomplete — drop it and bail
+            let _ = self.db.drop_table("items_migrated").await;
+            return Err(SedimentError::Database(format!(
+                "Staging row count mismatch: expected {}, got {}",
+                old_count, staging_count
+            )));
+        }
+
+        // Step 7: Drop old items (data is safe in staging)
         self.db.drop_table("items").await.map_err(|e| {
             SedimentError::Database(format!("Failed to drop old items table: {}", e))
         })?;
 
-        // Create new table with new schema
-        let schema = Arc::new(item_schema());
+        // Step 8: Create new items from staging data
+        let staging_data = staging_table
+            .query()
+            .execute()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Failed to read staging: {}", e)))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Failed to collect staging: {}", e)))?;
+
         let new_table = self
             .db
             .create_empty_table("items", schema.clone())
@@ -294,9 +469,8 @@ impl Database {
                 SedimentError::Database(format!("Failed to create new items table: {}", e))
             })?;
 
-        // Insert migrated data
-        if !new_batches.is_empty() {
-            let batches = RecordBatchIterator::new(new_batches.into_iter().map(Ok), schema);
+        if !staging_data.is_empty() {
+            let batches = RecordBatchIterator::new(staging_data.into_iter().map(Ok), schema);
             new_table
                 .add(Box::new(batches))
                 .execute()
@@ -305,6 +479,11 @@ impl Database {
                     SedimentError::Database(format!("Failed to insert migrated items: {}", e))
                 })?;
         }
+
+        // Step 9: Drop staging table (cleanup)
+        self.db.drop_table("items_migrated").await.map_err(|e| {
+            SedimentError::Database(format!("Failed to drop staging table: {}", e))
+        })?;
 
         info!("Schema migration completed successfully");
         Ok(())
@@ -470,12 +649,8 @@ impl Database {
             .await
             .map_err(|e| SedimentError::Database(format!("Failed to store item: {}", e)))?;
 
-        // If chunking is needed, create and store chunks
+        // If chunking is needed, create and store chunks with rollback on failure
         if should_chunk {
-            let embedder = self.embedder.clone();
-            let chunks_table = self.get_chunks_table().await?;
-
-            // Detect content type for smart chunking
             let content_type = detect_content_type(&item.content);
             let config = ChunkingConfig::default();
             let mut chunk_results = chunk_content(&item.content, content_type, &config);
@@ -490,27 +665,10 @@ impl Database {
                 chunk_results.truncate(MAX_CHUNKS_PER_ITEM);
             }
 
-            for (i, chunk_result) in chunk_results.iter().enumerate() {
-                let mut chunk = Chunk::new(&item.id, i, &chunk_result.content);
-
-                if let Some(ctx) = &chunk_result.context {
-                    chunk = chunk.with_context(ctx);
-                }
-
-                let chunk_embedding = embedder.embed(&chunk.content)?;
-                chunk.embedding = chunk_embedding;
-
-                let chunk_batch = chunk_to_batch(&chunk)?;
-                let batches =
-                    RecordBatchIterator::new(vec![Ok(chunk_batch)], Arc::new(chunk_schema()));
-
-                chunks_table
-                    .add(Box::new(batches))
-                    .execute()
-                    .await
-                    .map_err(|e| {
-                        SedimentError::Database(format!("Failed to store chunk: {}", e))
-                    })?;
+            if let Err(e) = self.store_chunks(&item.id, &chunk_results).await {
+                // Rollback: remove the parent item (and any partial chunks)
+                let _ = self.delete_item(&item.id).await;
+                return Err(e);
             }
 
             debug!(
@@ -523,22 +681,69 @@ impl Database {
         }
 
         // Detect conflicts after storing (informational only, avoids TOCTOU race)
+        // Uses pre-computed embedding to avoid re-embedding the same content.
         let potential_conflicts = self
-            .find_similar_items(
-                &item.content,
+            .find_similar_items_by_vector(
+                &item.embedding,
+                Some(&item.id),
                 CONFLICT_SIMILARITY_THRESHOLD,
                 CONFLICT_SEARCH_LIMIT,
             )
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| c.id != item.id)
-            .collect();
+            .unwrap_or_default();
 
         Ok(StoreResult {
             id: item.id,
             potential_conflicts,
         })
+    }
+
+    /// Store chunks for an item using batched embedding and a single LanceDB write.
+    async fn store_chunks(
+        &mut self,
+        item_id: &str,
+        chunk_results: &[crate::chunker::ChunkResult],
+    ) -> Result<()> {
+        let embedder = self.embedder.clone();
+        let chunks_table = self.get_chunks_table().await?;
+
+        // Batch embed all chunks in sub-batches to bound memory
+        let chunk_texts: Vec<&str> = chunk_results.iter().map(|cr| cr.content.as_str()).collect();
+        let mut all_embeddings = Vec::with_capacity(chunk_texts.len());
+        for batch_start in (0..chunk_texts.len()).step_by(EMBEDDING_BATCH_SIZE) {
+            let batch_end = (batch_start + EMBEDDING_BATCH_SIZE).min(chunk_texts.len());
+            let batch_embeddings = embedder.embed_batch(&chunk_texts[batch_start..batch_end])?;
+            all_embeddings.extend(batch_embeddings);
+        }
+
+        // Build all chunks with their embeddings
+        let mut all_chunk_batches = Vec::with_capacity(chunk_results.len());
+        for (i, (chunk_result, embedding)) in
+            chunk_results.iter().zip(all_embeddings).enumerate()
+        {
+            let mut chunk = Chunk::new(item_id, i, &chunk_result.content);
+            if let Some(ctx) = &chunk_result.context {
+                chunk = chunk.with_context(ctx);
+            }
+            chunk.embedding = embedding;
+            all_chunk_batches.push(chunk_to_batch(&chunk)?);
+        }
+
+        // Single LanceDB write for all chunks
+        if !all_chunk_batches.is_empty() {
+            let schema = Arc::new(chunk_schema());
+            let batches =
+                RecordBatchIterator::new(all_chunk_batches.into_iter().map(Ok), schema);
+            chunks_table
+                .add(Box::new(batches))
+                .execute()
+                .await
+                .map_err(|e| {
+                    SedimentError::Database(format!("Failed to store chunks: {}", e))
+                })?;
+        }
+
+        Ok(())
     }
 
     /// Search items by semantic similarity
@@ -705,16 +910,28 @@ impl Database {
         min_similarity: f32,
         limit: usize,
     ) -> Result<Vec<ConflictInfo>> {
-        // Generate embedding for the content
         let embedding = self.embedder.embed(content)?;
+        self.find_similar_items_by_vector(&embedding, None, min_similarity, limit)
+            .await
+    }
 
+    /// Find items similar to a pre-computed embedding vector (avoids re-embedding).
+    ///
+    /// If `exclude_id` is provided, results matching that ID are filtered out.
+    pub async fn find_similar_items_by_vector(
+        &self,
+        embedding: &[f32],
+        exclude_id: Option<&str>,
+        min_similarity: f32,
+        limit: usize,
+    ) -> Result<Vec<ConflictInfo>> {
         let table = match &self.items_table {
             Some(t) => t,
             None => return Ok(Vec::new()),
         };
 
         let results = table
-            .vector_search(embedding)
+            .vector_search(embedding.to_vec())
             .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?
             .limit(limit)
             .execute()
@@ -733,6 +950,10 @@ impl Database {
                 .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
 
             for (i, item) in items.into_iter().enumerate() {
+                if exclude_id.is_some_and(|eid| eid == item.id) {
+                    continue;
+                }
+
                 let distance = distances.map(|d| d.value(i)).unwrap_or(0.0);
                 let similarity = 1.0 / (1.0 + distance);
 

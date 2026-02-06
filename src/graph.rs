@@ -472,6 +472,128 @@ impl GraphStore {
         Ok(connections)
     }
 
+    /// Get 1-hop neighbors grouped by source ID.
+    ///
+    /// For each input ID, returns a list of neighbor IDs from RELATED or SUPERSEDES edges.
+    /// Input IDs are excluded from results.
+    pub fn get_neighbors_mapped(
+        &self,
+        ids: &[&str],
+        min_strength: f64,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
+        let ph = placeholders.join(",");
+        let strength_idx = ids.len() + 1;
+
+        let sql = format!(
+            "SELECT
+                CASE WHEN from_id IN ({ph}) THEN from_id ELSE to_id END AS source,
+                CASE WHEN from_id IN ({ph}) THEN to_id ELSE from_id END AS neighbor,
+                strength
+             FROM graph_edges
+             WHERE (from_id IN ({ph}) OR to_id IN ({ph}))
+               AND edge_type IN ('related', 'supersedes')
+               AND strength >= ?{strength_idx}
+             LIMIT 500"
+        );
+
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| {
+            SedimentError::Database(format!("Failed to prepare neighbors_mapped query: {}", e))
+        })?;
+
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        for id in ids {
+            param_values.push(Box::new(id.to_string()));
+        }
+        param_values.push(Box::new(min_strength));
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
+
+        let rows = stmt
+            .query_map(params_ref.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            })
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to query neighbors_mapped: {}", e))
+            })?;
+
+        let input_set: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+
+        for row in rows {
+            let (source, neighbor) = row.map_err(|e| {
+                SedimentError::Database(format!("Failed to read neighbor_mapped: {}", e))
+            })?;
+            if !input_set.contains(neighbor.as_str()) {
+                map.entry(source).or_default().push(neighbor);
+            }
+        }
+
+        Ok(map)
+    }
+
+    /// Get edge counts for multiple items in a single query.
+    ///
+    /// Returns a map from item ID to its total edge count (all edge types).
+    pub fn get_edge_counts(&self, ids: &[&str]) -> Result<std::collections::HashMap<String, u32>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Build a VALUES CTE for the input IDs
+        let unions: String = (1..=ids.len())
+            .map(|i| {
+                if i == 1 {
+                    format!("SELECT ?{} AS id", i)
+                } else {
+                    format!("UNION ALL SELECT ?{}", i)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Count edges where the item appears on either side
+        let sql = format!(
+            "SELECT ids.id, COUNT(e.rowid) FROM ({unions}) ids
+            LEFT JOIN graph_edges e ON e.from_id = ids.id OR e.to_id = ids.id
+            GROUP BY ids.id"
+        );
+
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| {
+            SedimentError::Database(format!("Failed to prepare edge_counts query: {}", e))
+        })?;
+
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to query edge_counts: {}", e))
+            })?;
+
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (id, count) = row.map_err(|e| {
+                SedimentError::Database(format!("Failed to read edge_count: {}", e))
+            })?;
+            map.insert(id, count);
+        }
+
+        Ok(map)
+    }
+
     /// Get the edge count for an item (total number of edges of all types).
     pub fn get_edge_count(&self, item_id: &str) -> Result<u32> {
         let count: i64 = self
@@ -623,5 +745,54 @@ mod tests {
             "get_neighbors should return at most 100, got {}",
             neighbors.len()
         );
+    }
+
+    #[test]
+    fn test_get_neighbors_mapped() {
+        let graph = open_test_graph();
+        let now = chrono::Utc::now().timestamp();
+        graph.add_node("A", Some("proj"), now).unwrap();
+        graph.add_node("B", Some("proj"), now).unwrap();
+        graph.add_node("C", Some("proj"), now).unwrap();
+        graph.add_node("D", Some("proj"), now).unwrap();
+
+        graph.add_related_edge("A", "C", 0.9, "test").unwrap();
+        graph.add_related_edge("B", "D", 0.9, "test").unwrap();
+
+        let map = graph.get_neighbors_mapped(&["A", "B"], 0.0).unwrap();
+
+        // A should have C as neighbor, B should have D
+        assert!(map.get("A").unwrap().contains(&"C".to_string()));
+        assert!(map.get("B").unwrap().contains(&"D".to_string()));
+        // Input IDs should not appear as neighbors
+        for neighbors in map.values() {
+            assert!(!neighbors.contains(&"A".to_string()));
+            assert!(!neighbors.contains(&"B".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_get_edge_counts() {
+        let graph = open_test_graph();
+        let now = chrono::Utc::now().timestamp();
+        graph.add_node("X", Some("proj"), now).unwrap();
+        graph.add_node("Y", Some("proj"), now).unwrap();
+        graph.add_node("Z", Some("proj"), now).unwrap();
+
+        graph.add_related_edge("X", "Y", 0.9, "test").unwrap();
+        graph.add_related_edge("X", "Z", 0.9, "test").unwrap();
+        graph.add_related_edge("Y", "Z", 0.9, "test").unwrap();
+
+        let counts = graph.get_edge_counts(&["X", "Y", "Z"]).unwrap();
+
+        // Verify batch counts match individual counts
+        assert_eq!(counts.get("X").copied().unwrap_or(0), graph.get_edge_count("X").unwrap());
+        assert_eq!(counts.get("Y").copied().unwrap_or(0), graph.get_edge_count("Y").unwrap());
+        assert_eq!(counts.get("Z").copied().unwrap_or(0), graph.get_edge_count("Z").unwrap());
+
+        // X has 2 edges (X-Y, X-Z), Y has 2 (X-Y, Y-Z), Z has 2 (X-Z, Y-Z)
+        assert_eq!(counts["X"], 2);
+        assert_eq!(counts["Y"], 2);
+        assert_eq!(counts["Z"], 2);
     }
 }
