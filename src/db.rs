@@ -212,12 +212,10 @@ impl Database {
             info!("Detected interrupted migration, recovering...");
             self.recover_interrupted_migration(&table_names).await?;
             // Re-fetch table names after recovery
-            table_names = self
-                .db
-                .table_names()
-                .execute()
-                .await
-                .map_err(|e| SedimentError::Database(format!("Failed to list tables: {}", e)))?;
+            table_names =
+                self.db.table_names().execute().await.map_err(|e| {
+                    SedimentError::Database(format!("Failed to list tables: {}", e))
+                })?;
         }
 
         // Check if migration is needed (items table exists but has old schema)
@@ -422,8 +420,7 @@ impl Database {
             })?;
 
         if !new_batches.is_empty() {
-            let batches =
-                RecordBatchIterator::new(new_batches.into_iter().map(Ok), schema.clone());
+            let batches = RecordBatchIterator::new(new_batches.into_iter().map(Ok), schema.clone());
             staging_table
                 .add(Box::new(batches))
                 .execute()
@@ -434,9 +431,10 @@ impl Database {
         }
 
         // Step 6: Verify staging row count
-        let staging_count = staging_table.count_rows(None).await.map_err(|e| {
-            SedimentError::Database(format!("Failed to count staging rows: {}", e))
-        })?;
+        let staging_count = staging_table
+            .count_rows(None)
+            .await
+            .map_err(|e| SedimentError::Database(format!("Failed to count staging rows: {}", e)))?;
         if staging_count != old_count {
             // Staging is incomplete — drop it and bail
             let _ = self.db.drop_table("items_migrated").await;
@@ -482,9 +480,10 @@ impl Database {
         }
 
         // Step 9: Drop staging table (cleanup)
-        self.db.drop_table("items_migrated").await.map_err(|e| {
-            SedimentError::Database(format!("Failed to drop staging table: {}", e))
-        })?;
+        self.db
+            .drop_table("items_migrated")
+            .await
+            .map_err(|e| SedimentError::Database(format!("Failed to drop staging table: {}", e)))?;
 
         info!("Schema migration completed successfully");
         Ok(())
@@ -719,9 +718,7 @@ impl Database {
 
         // Build all chunks with their embeddings
         let mut all_chunk_batches = Vec::with_capacity(chunk_results.len());
-        for (i, (chunk_result, embedding)) in
-            chunk_results.iter().zip(all_embeddings).enumerate()
-        {
+        for (i, (chunk_result, embedding)) in chunk_results.iter().zip(all_embeddings).enumerate() {
             let mut chunk = Chunk::new(item_id, i, &chunk_result.content);
             if let Some(ctx) = &chunk_result.context {
                 chunk = chunk.with_context(ctx);
@@ -733,15 +730,12 @@ impl Database {
         // Single LanceDB write for all chunks
         if !all_chunk_batches.is_empty() {
             let schema = Arc::new(chunk_schema());
-            let batches =
-                RecordBatchIterator::new(all_chunk_batches.into_iter().map(Ok), schema);
+            let batches = RecordBatchIterator::new(all_chunk_batches.into_iter().map(Ok), schema);
             chunks_table
                 .add(Box::new(batches))
                 .execute()
                 .await
-                .map_err(|e| {
-                    SedimentError::Database(format!("Failed to store chunks: {}", e))
-                })?;
+                .map_err(|e| SedimentError::Database(format!("Failed to store chunks: {}", e)))?;
         }
 
         Ok(())
@@ -1201,25 +1195,24 @@ pub async fn migrate_project_id(
     let mut total_updated = 0u64;
 
     if table_names.contains(&"items".to_string()) {
-        let table = db.open_table("items").execute().await.map_err(|e| {
-            SedimentError::Database(format!("Failed to open items table: {}", e))
-        })?;
+        let table =
+            db.open_table("items").execute().await.map_err(|e| {
+                SedimentError::Database(format!("Failed to open items table: {}", e))
+            })?;
 
         let updated = table
             .update()
-            .only_if(format!(
-                "project_id = '{}'",
-                sanitize_sql_string(old_id)
-            ))
+            .only_if(format!("project_id = '{}'", sanitize_sql_string(old_id)))
             .column("project_id", format!("'{}'", sanitize_sql_string(new_id)))
             .execute()
             .await
-            .map_err(|e| {
-                SedimentError::Database(format!("Failed to migrate items: {}", e))
-            })?;
+            .map_err(|e| SedimentError::Database(format!("Failed to migrate items: {}", e)))?;
 
         total_updated += updated;
-        info!("Migrated {} items from project {} to {}", updated, old_id, new_id);
+        info!(
+            "Migrated {} items from project {} to {}",
+            updated, old_id, new_id
+        );
     }
 
     Ok(total_updated)
@@ -1732,8 +1725,8 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(vec![id])),
                 Arc::new(StringArray::from(vec![content])),
-                Arc::new(StringArray::from(vec![None::<&str>])),  // project_id
-                Arc::new(StringArray::from(vec![None::<&str>])),  // tags
+                Arc::new(StringArray::from(vec![None::<&str>])), // project_id
+                Arc::new(StringArray::from(vec![None::<&str>])), // tags
                 Arc::new(BooleanArray::from(vec![false])),
                 Arc::new(Int64Array::from(vec![1700000000i64])),
                 Arc::new(vector),
@@ -1773,7 +1766,10 @@ mod tests {
         };
 
         let needs_migration = db.check_needs_migration().await.unwrap();
-        assert!(needs_migration, "Old schema with tags column should need migration");
+        assert!(
+            needs_migration,
+            "Old schema with tags column should need migration"
+        );
     }
 
     #[tokio::test]
@@ -1838,7 +1834,10 @@ mod tests {
 
         // Verify migration happened: no tags column
         let needs_migration = db.check_needs_migration().await.unwrap();
-        assert!(!needs_migration, "Schema should be migrated (no tags column)");
+        assert!(
+            !needs_migration,
+            "Schema should be migrated (no tags column)"
+        );
 
         // Verify data preserved
         let item_a = db.get_item("id-aaa").await.unwrap();
@@ -1960,7 +1959,10 @@ mod tests {
 
         // Verify data preserved
         let item = db.get_item("old-id").await.unwrap();
-        assert!(item.is_some(), "Item should be preserved through recovery + migration");
+        assert!(
+            item.is_some(),
+            "Item should be preserved through recovery + migration"
+        );
 
         // Verify staging dropped
         let table_names = db.db.table_names().execute().await.unwrap();
@@ -2049,7 +2051,9 @@ mod tests {
         let db_path = tmp.path().join("data");
         let malicious_pid = "'; DROP TABLE items;--".to_string();
 
-        let mut db = Database::open_with_project(&db_path, Some(malicious_pid)).await.unwrap();
+        let mut db = Database::open_with_project(&db_path, Some(malicious_pid))
+            .await
+            .unwrap();
 
         let result = db
             .list_items(ItemFilters::new(), Some(10), crate::ListScope::Project)

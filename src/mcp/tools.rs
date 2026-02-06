@@ -624,10 +624,10 @@ async fn execute_recall(
             }
 
             // Related IDs from graph (batch lookup)
-            if let Some(related) = neighbors_map.get(&r.id) {
-                if !related.is_empty() {
-                    obj["related_ids"] = json!(related);
-                }
+            if let Some(related) = neighbors_map.get(&r.id)
+                && !related.is_empty()
+            {
+                obj["related_ids"] = json!(related);
             }
 
             obj
@@ -975,12 +975,7 @@ mod tests {
         .await;
 
         // List items
-        let list_result = execute_tool(
-            &ctx,
-            "list",
-            Some(json!({ "scope": "project" })),
-        )
-        .await;
+        let list_result = execute_tool(&ctx, "list", Some(json!({ "scope": "project" }))).await;
         assert!(list_result.is_error.is_none(), "List should succeed");
 
         let text = &list_result.content[0].text;
@@ -1036,21 +1031,11 @@ mod tests {
         let item_id = parsed["id"].as_str().unwrap().to_string();
 
         // Forget it
-        let forget_result = execute_tool(
-            &ctx,
-            "forget",
-            Some(json!({ "id": item_id })),
-        )
-        .await;
+        let forget_result = execute_tool(&ctx, "forget", Some(json!({ "id": item_id }))).await;
         assert!(forget_result.is_error.is_none(), "Forget should succeed");
 
         // List should be empty
-        let list_result = execute_tool(
-            &ctx,
-            "list",
-            Some(json!({ "scope": "project" })),
-        )
-        .await;
+        let list_result = execute_tool(&ctx, "list", Some(json!({ "scope": "project" }))).await;
         let text = &list_result.content[0].text;
         assert!(
             text.contains("No items stored yet"),
@@ -1064,13 +1049,11 @@ mod tests {
     async fn test_recall_empty_db() {
         let (ctx, _tmp) = setup_test_context().await;
 
-        let result = execute_tool(
-            &ctx,
-            "recall",
-            Some(json!({ "query": "anything" })),
-        )
-        .await;
-        assert!(result.is_error.is_none(), "Recall on empty DB should not error");
+        let result = execute_tool(&ctx, "recall", Some(json!({ "query": "anything" }))).await;
+        assert!(
+            result.is_error.is_none(),
+            "Recall on empty DB should not error"
+        );
 
         let text = &result.content[0].text;
         assert!(
@@ -1086,12 +1069,7 @@ mod tests {
         let (ctx, _tmp) = setup_test_context().await;
 
         let large_content = "x".repeat(1_100_000); // >1MB
-        let result = execute_tool(
-            &ctx,
-            "store",
-            Some(json!({ "content": large_content })),
-        )
-        .await;
+        let result = execute_tool(&ctx, "store", Some(json!({ "content": large_content }))).await;
         assert!(
             result.is_error == Some(true),
             "Should reject oversized content"
@@ -1111,12 +1089,7 @@ mod tests {
         let (ctx, _tmp) = setup_test_context().await;
 
         let large_query = "x".repeat(11_000); // >10KB
-        let result = execute_tool(
-            &ctx,
-            "recall",
-            Some(json!({ "query": large_query })),
-        )
-        .await;
+        let result = execute_tool(&ctx, "recall", Some(json!({ "query": large_query }))).await;
         assert!(
             result.is_error == Some(true),
             "Should reject oversized query"
@@ -1137,10 +1110,7 @@ mod tests {
 
         // No params at all
         let result = execute_tool(&ctx, "store", None).await;
-        assert!(
-            result.is_error == Some(true),
-            "Should error with no params"
-        );
+        assert!(result.is_error == Some(true), "Should error with no params");
 
         // Empty object (missing required 'content')
         let result = execute_tool(&ctx, "store", Some(json!({}))).await;

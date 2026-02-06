@@ -516,10 +516,7 @@ impl GraphStore {
 
         let rows = stmt
             .query_map(params_ref.as_slice(), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|e| {
                 SedimentError::Database(format!("Failed to query neighbors_mapped: {}", e))
@@ -572,16 +569,16 @@ impl GraphStore {
             SedimentError::Database(format!("Failed to prepare edge_counts query: {}", e))
         })?;
 
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
 
         let rows = stmt
             .query_map(params.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
             })
-            .map_err(|e| {
-                SedimentError::Database(format!("Failed to query edge_counts: {}", e))
-            })?;
+            .map_err(|e| SedimentError::Database(format!("Failed to query edge_counts: {}", e)))?;
 
         let mut map = std::collections::HashMap::new();
         for row in rows {
@@ -609,7 +606,10 @@ impl GraphStore {
             })?;
 
         if updated > 0 {
-            debug!("Migrated {} graph nodes from project {} to {}", updated, old_id, new_id);
+            debug!(
+                "Migrated {} graph nodes from project {} to {}",
+                updated, old_id, new_id
+            );
         }
         Ok(updated)
     }
@@ -806,9 +806,18 @@ mod tests {
         let counts = graph.get_edge_counts(&["X", "Y", "Z"]).unwrap();
 
         // Verify batch counts match individual counts
-        assert_eq!(counts.get("X").copied().unwrap_or(0), graph.get_edge_count("X").unwrap());
-        assert_eq!(counts.get("Y").copied().unwrap_or(0), graph.get_edge_count("Y").unwrap());
-        assert_eq!(counts.get("Z").copied().unwrap_or(0), graph.get_edge_count("Z").unwrap());
+        assert_eq!(
+            counts.get("X").copied().unwrap_or(0),
+            graph.get_edge_count("X").unwrap()
+        );
+        assert_eq!(
+            counts.get("Y").copied().unwrap_or(0),
+            graph.get_edge_count("Y").unwrap()
+        );
+        assert_eq!(
+            counts.get("Z").copied().unwrap_or(0),
+            graph.get_edge_count("Z").unwrap()
+        );
 
         // X has 2 edges (X-Y, X-Z), Y has 2 (X-Y, Y-Z), Z has 2 (X-Z, Y-Z)
         assert_eq!(counts["X"], 2);

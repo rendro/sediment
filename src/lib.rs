@@ -191,10 +191,7 @@ pub fn derive_git_root_commit(project_root: &Path) -> std::io::Result<Option<Str
     let hash = stdout.lines().next().unwrap_or("").trim();
 
     // Validate: must be non-empty hex, at most 64 chars (covers SHA-1 40 and SHA-256 64)
-    if !hash.is_empty()
-        && hash.len() <= 64
-        && hash.chars().all(|c| c.is_ascii_hexdigit())
-    {
+    if !hash.is_empty() && hash.len() <= 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
         Ok(Some(hash.to_string()))
     } else {
         Ok(None)
@@ -298,11 +295,11 @@ pub fn clear_migration_marker(project_root: &Path) -> std::io::Result<()> {
     let config_path = sediment_dir.join("config");
 
     let content = std::fs::read_to_string(&config_path)?;
-    if let Ok(mut config) = serde_json::from_str::<ProjectConfig>(&content) {
-        if config.migrated_from.is_some() {
-            config.migrated_from = None;
-            write_config_atomic(&sediment_dir, &config_path, &config)?;
-        }
+    if let Ok(mut config) = serde_json::from_str::<ProjectConfig>(&content)
+        && config.migrated_from.is_some()
+    {
+        config.migrated_from = None;
+        write_config_atomic(&sediment_dir, &config_path, &config)?;
     }
     Ok(())
 }
@@ -421,10 +418,26 @@ mod tests {
         let dir = tmp.path();
 
         // git init + commit
-        Command::new("git").args(["init"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.name", "Test"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["commit", "--allow-empty", "-m", "init"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
 
         let result = derive_git_root_commit(dir).unwrap();
         assert!(result.is_some(), "Should return root commit hash");
@@ -439,7 +452,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
 
-        Command::new("git").args(["init"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
 
         let result = derive_git_root_commit(dir).unwrap();
         assert!(result.is_none(), "Repo with no commits should return None");
@@ -458,14 +475,33 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
 
-        Command::new("git").args(["init"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.name", "Test"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["commit", "--allow-empty", "-m", "init"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
 
         let project_id = get_or_create_project_id(dir).unwrap();
         let expected = derive_git_root_commit(dir).unwrap().unwrap();
-        assert_eq!(project_id, expected, "Project ID should be the git root commit hash");
+        assert_eq!(
+            project_id, expected,
+            "Project ID should be the git root commit hash"
+        );
 
         // Verify config source
         let config_content = std::fs::read_to_string(dir.join(".sediment/config")).unwrap();
@@ -487,10 +523,26 @@ mod tests {
         std::fs::write(sediment_dir.join("config"), &old_config).unwrap();
 
         // Now create a git repo with a commit
-        Command::new("git").args(["init"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.name", "Test"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["commit", "--allow-empty", "-m", "init"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
 
         // Calling get_or_create_project_id should migrate to git hash
         let project_id = get_or_create_project_id(dir).unwrap();
@@ -518,10 +570,26 @@ mod tests {
         let dir = tmp.path();
 
         // Create git repo with commit
-        Command::new("git").args(["init"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.name", "Test"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["commit", "--allow-empty", "-m", "init"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
 
         // First call creates config with git-root-commit source
         let id1 = get_or_create_project_id(dir).unwrap();
@@ -534,7 +602,10 @@ mod tests {
         let config_content = std::fs::read_to_string(dir.join(".sediment/config")).unwrap();
         let config: ProjectConfig = serde_json::from_str(&config_content).unwrap();
         assert_eq!(config.source, "git-root-commit");
-        assert!(config.migrated_from.is_none(), "No migration on fresh git config");
+        assert!(
+            config.migrated_from.is_none(),
+            "No migration on fresh git config"
+        );
     }
 
     #[test]
@@ -565,16 +636,41 @@ mod tests {
         std::fs::create_dir_all(&origin_dir).unwrap();
 
         // Create origin repo with a commit
-        Command::new("git").args(["init"]).current_dir(&origin_dir).output().unwrap();
-        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(&origin_dir).output().unwrap();
-        Command::new("git").args(["config", "user.name", "Test"]).current_dir(&origin_dir).output().unwrap();
-        Command::new("git").args(["commit", "--allow-empty", "-m", "init"]).current_dir(&origin_dir).output().unwrap();
-        Command::new("git").args(["commit", "--allow-empty", "-m", "second"]).current_dir(&origin_dir).output().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&origin_dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&origin_dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&origin_dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(&origin_dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "second"])
+            .current_dir(&origin_dir)
+            .output()
+            .unwrap();
 
         // Shallow clone (file:// protocol required for local shallow clones)
         let origin_url = format!("file://{}", origin_dir.display());
         Command::new("git")
-            .args(["clone", "--depth=1", &origin_url, shallow_dir.to_str().unwrap()])
+            .args([
+                "clone",
+                "--depth=1",
+                &origin_url,
+                shallow_dir.to_str().unwrap(),
+            ])
             .output()
             .unwrap();
 
