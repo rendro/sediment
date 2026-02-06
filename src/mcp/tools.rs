@@ -887,4 +887,266 @@ mod tests {
         assert_eq!(truncate("héllo wörld", 5), "hé...");
         assert_eq!(truncate("日本語テスト", 4), "日...");
     }
+
+    // ========== Integration Tests ==========
+
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use tokio::sync::Semaphore;
+
+    /// Create a ServerContext with temp dirs for integration testing.
+    async fn setup_test_context() -> (ServerContext, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("data");
+        let access_db_path = tmp.path().join("access.db");
+
+        let embedder = Arc::new(crate::Embedder::new().unwrap());
+        let project_id = Some("test-project-00000001".to_string());
+
+        let ctx = ServerContext {
+            db_path,
+            access_db_path,
+            project_id,
+            embedder,
+            cwd: PathBuf::from("."),
+            consolidation_semaphore: Arc::new(Semaphore::new(1)),
+            recall_count: std::sync::atomic::AtomicU64::new(0),
+            rate_limit: Mutex::new(super::super::server::RateLimitState {
+                window_start_ms: 0,
+                count: 0,
+            }),
+        };
+
+        (ctx, tmp)
+    }
+
+    #[tokio::test]
+    #[ignore] // requires model download
+    async fn test_store_and_recall_roundtrip() {
+        let (ctx, _tmp) = setup_test_context().await;
+
+        // Store an item
+        let store_result = execute_tool(
+            &ctx,
+            "store",
+            Some(json!({ "content": "Rust is a systems programming language" })),
+        )
+        .await;
+        assert!(
+            store_result.is_error.is_none(),
+            "Store should succeed: {:?}",
+            store_result.content
+        );
+
+        // Recall by query
+        let recall_result = execute_tool(
+            &ctx,
+            "recall",
+            Some(json!({ "query": "systems programming language" })),
+        )
+        .await;
+        assert!(recall_result.is_error.is_none(), "Recall should succeed");
+
+        let text = &recall_result.content[0].text;
+        assert!(
+            text.contains("Rust is a systems programming language"),
+            "Recall should return stored content, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires model download
+    async fn test_store_and_list() {
+        let (ctx, _tmp) = setup_test_context().await;
+
+        // Store 2 items
+        execute_tool(
+            &ctx,
+            "store",
+            Some(json!({ "content": "First item for listing" })),
+        )
+        .await;
+        execute_tool(
+            &ctx,
+            "store",
+            Some(json!({ "content": "Second item for listing" })),
+        )
+        .await;
+
+        // List items
+        let list_result = execute_tool(
+            &ctx,
+            "list",
+            Some(json!({ "scope": "project" })),
+        )
+        .await;
+        assert!(list_result.is_error.is_none(), "List should succeed");
+
+        let text = &list_result.content[0].text;
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["count"], 2, "Should list 2 items");
+    }
+
+    #[tokio::test]
+    #[ignore] // requires model download
+    async fn test_store_conflict_detection() {
+        let (ctx, _tmp) = setup_test_context().await;
+
+        // Store first item
+        execute_tool(
+            &ctx,
+            "store",
+            Some(json!({ "content": "The quick brown fox jumps over the lazy dog" })),
+        )
+        .await;
+
+        // Store nearly identical item
+        let result = execute_tool(
+            &ctx,
+            "store",
+            Some(json!({ "content": "The quick brown fox jumps over the lazy dog" })),
+        )
+        .await;
+        assert!(result.is_error.is_none(), "Store should succeed");
+
+        let text = &result.content[0].text;
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed.get("potential_conflicts").is_some(),
+            "Should detect conflict for near-duplicate content, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires model download
+    async fn test_forget_removes_item() {
+        let (ctx, _tmp) = setup_test_context().await;
+
+        // Store an item
+        let store_result = execute_tool(
+            &ctx,
+            "store",
+            Some(json!({ "content": "Item to be forgotten" })),
+        )
+        .await;
+        let text = &store_result.content[0].text;
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let item_id = parsed["id"].as_str().unwrap().to_string();
+
+        // Forget it
+        let forget_result = execute_tool(
+            &ctx,
+            "forget",
+            Some(json!({ "id": item_id })),
+        )
+        .await;
+        assert!(forget_result.is_error.is_none(), "Forget should succeed");
+
+        // List should be empty
+        let list_result = execute_tool(
+            &ctx,
+            "list",
+            Some(json!({ "scope": "project" })),
+        )
+        .await;
+        let text = &list_result.content[0].text;
+        assert!(
+            text.contains("No items stored yet"),
+            "Should have no items after forget, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires model download
+    async fn test_recall_empty_db() {
+        let (ctx, _tmp) = setup_test_context().await;
+
+        let result = execute_tool(
+            &ctx,
+            "recall",
+            Some(json!({ "query": "anything" })),
+        )
+        .await;
+        assert!(result.is_error.is_none(), "Recall on empty DB should not error");
+
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("No items found"),
+            "Should indicate no items found, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires model download
+    async fn test_store_rejects_oversized_content() {
+        let (ctx, _tmp) = setup_test_context().await;
+
+        let large_content = "x".repeat(1_100_000); // >1MB
+        let result = execute_tool(
+            &ctx,
+            "store",
+            Some(json!({ "content": large_content })),
+        )
+        .await;
+        assert!(
+            result.is_error == Some(true),
+            "Should reject oversized content"
+        );
+
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("too large"),
+            "Error should mention size, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires model download
+    async fn test_recall_rejects_oversized_query() {
+        let (ctx, _tmp) = setup_test_context().await;
+
+        let large_query = "x".repeat(11_000); // >10KB
+        let result = execute_tool(
+            &ctx,
+            "recall",
+            Some(json!({ "query": large_query })),
+        )
+        .await;
+        assert!(
+            result.is_error == Some(true),
+            "Should reject oversized query"
+        );
+
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("too large"),
+            "Error should mention size, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires model download
+    async fn test_store_missing_params() {
+        let (ctx, _tmp) = setup_test_context().await;
+
+        // No params at all
+        let result = execute_tool(&ctx, "store", None).await;
+        assert!(
+            result.is_error == Some(true),
+            "Should error with no params"
+        );
+
+        // Empty object (missing required 'content')
+        let result = execute_tool(&ctx, "store", Some(json!({}))).await;
+        assert!(
+            result.is_error == Some(true),
+            "Should error with missing content"
+        );
+    }
 }
