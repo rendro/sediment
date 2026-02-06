@@ -306,8 +306,8 @@ pub fn clear_migration_marker(project_root: &Path) -> std::io::Result<()> {
 
 /// Apply similarity boosting based on project context.
 ///
-/// - Same project: 1.15x boost (capped at 1.0)
-/// - Different project: 0.95x penalty
+/// - Same project: no change (identity)
+/// - Different project: 0.875x penalty (12.5pp spread)
 /// - Global or no context: no change
 pub fn boost_similarity(
     base: f32,
@@ -315,9 +315,9 @@ pub fn boost_similarity(
     current_project: Option<&str>,
 ) -> f32 {
     match (mem_project, current_project) {
-        (Some(m), Some(c)) if m == c => (base * 1.15).min(1.0), // Same project: boost
-        (Some(_), Some(_)) => base * 0.95,                      // Different project: slight penalty
-        _ => base,                                              // Global or no context
+        (Some(m), Some(c)) if m == c => base, // Same project: no boost needed
+        (Some(_), Some(_)) => base * 0.875,   // Different project: 12.5pp penalty
+        _ => base,                            // Global or no context
     }
 }
 
@@ -398,8 +398,8 @@ mod tests {
 
     #[test]
     fn test_boost_similarity() {
-        assert!((boost_similarity(0.5, Some("p1"), Some("p1")) - 0.575).abs() < 0.001);
-        assert!((boost_similarity(0.5, Some("p1"), Some("p2")) - 0.475).abs() < 0.001);
+        assert!((boost_similarity(0.5, Some("p1"), Some("p1")) - 0.5).abs() < 0.001);
+        assert!((boost_similarity(0.5, Some("p1"), Some("p2")) - 0.4375).abs() < 0.001);
         assert!((boost_similarity(0.5, None, Some("p1")) - 0.5).abs() < 0.001);
     }
 

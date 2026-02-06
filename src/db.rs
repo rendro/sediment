@@ -41,6 +41,7 @@ use chrono::{TimeZone, Utc};
 use futures::TryStreamExt;
 use lancedb::Table;
 use lancedb::connect;
+use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use tracing::{debug, info};
 
@@ -538,41 +539,67 @@ impl Database {
         .map_err(|e| SedimentError::Database(format!("Failed to create migrated batch: {}", e)))
     }
 
-    /// Ensure vector indexes exist on tables with enough rows.
+    /// Ensure vector and FTS indexes exist on tables with enough rows.
     ///
-    /// LanceDB requires at least 256 rows before creating an index.
-    /// Once created, the index converts brute-force scans to HNSW/IVF-PQ.
+    /// LanceDB requires at least 256 rows before creating a vector index.
+    /// Once created, the vector index converts brute-force scans to HNSW/IVF-PQ.
+    /// The FTS index enables full-text search for hybrid retrieval.
     async fn ensure_vector_index(&self) -> Result<()> {
         const MIN_ROWS_FOR_INDEX: usize = 256;
 
         for (name, table_opt) in [("items", &self.items_table), ("chunks", &self.chunks_table)] {
             if let Some(table) = table_opt {
                 let row_count = table.count_rows(None).await.unwrap_or(0);
-                if row_count < MIN_ROWS_FOR_INDEX {
-                    continue;
-                }
 
-                // Check if index already exists by listing indices
+                // Check existing indices
                 let indices = table.list_indices().await.unwrap_or_default();
 
-                let has_vector_index = indices
-                    .iter()
-                    .any(|idx| idx.columns.contains(&"vector".to_string()));
+                // Vector index (requires 256+ rows)
+                if row_count >= MIN_ROWS_FOR_INDEX {
+                    let has_vector_index = indices
+                        .iter()
+                        .any(|idx| idx.columns.contains(&"vector".to_string()));
 
-                if !has_vector_index {
-                    info!(
-                        "Creating vector index on {} table ({} rows)",
-                        name, row_count
-                    );
-                    match table
-                        .create_index(&["vector"], lancedb::index::Index::Auto)
-                        .execute()
-                        .await
-                    {
-                        Ok(_) => info!("Vector index created on {} table", name),
-                        Err(e) => {
-                            // Non-fatal: brute-force search still works
-                            tracing::warn!("Failed to create vector index on {}: {}", name, e);
+                    if !has_vector_index {
+                        info!(
+                            "Creating vector index on {} table ({} rows)",
+                            name, row_count
+                        );
+                        match table
+                            .create_index(&["vector"], lancedb::index::Index::Auto)
+                            .execute()
+                            .await
+                        {
+                            Ok(_) => info!("Vector index created on {} table", name),
+                            Err(e) => {
+                                // Non-fatal: brute-force search still works
+                                tracing::warn!("Failed to create vector index on {}: {}", name, e);
+                            }
+                        }
+                    }
+                }
+
+                // FTS index on content column (no minimum row requirement)
+                if row_count > 0 {
+                    let has_fts_index = indices
+                        .iter()
+                        .any(|idx| idx.columns.contains(&"content".to_string()));
+
+                    if !has_fts_index {
+                        info!("Creating FTS index on {} table ({} rows)", name, row_count);
+                        match table
+                            .create_index(
+                                &["content"],
+                                lancedb::index::Index::FTS(Default::default()),
+                            )
+                            .execute()
+                            .await
+                        {
+                            Ok(_) => info!("FTS index created on {} table", name),
+                            Err(e) => {
+                                // Non-fatal: vector-only search still works
+                                tracing::warn!("Failed to create FTS index on {}: {}", name, e);
+                            }
                         }
                     }
                 }
@@ -741,6 +768,44 @@ impl Database {
         Ok(())
     }
 
+    /// Run a full-text search on the items table and return a map of item_id → rank.
+    /// Returns None if FTS is unavailable (no index or query fails).
+    async fn fts_rank_items(
+        &self,
+        table: &Table,
+        query: &str,
+        limit: usize,
+    ) -> Option<std::collections::HashMap<String, usize>> {
+        let fts_query =
+            FullTextSearchQuery::new(query.to_string()).columns(Some(vec!["content".to_string()]));
+
+        let fts_results = table
+            .query()
+            .full_text_search(fts_query)
+            .limit(limit)
+            .execute()
+            .await
+            .ok()?
+            .try_collect::<Vec<_>>()
+            .await
+            .ok()?;
+
+        let mut ranks = std::collections::HashMap::new();
+        let mut rank = 0usize;
+        for batch in fts_results {
+            let ids = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())?;
+            for i in 0..ids.len() {
+                if !ids.is_null(i) {
+                    ranks.insert(ids.value(i).to_string(), rank);
+                    rank += 1;
+                }
+            }
+        }
+        Some(ranks)
+    }
+
     /// Search items by semantic similarity
     pub async fn search_items(
         &mut self,
@@ -761,12 +826,20 @@ impl Database {
         let mut results_map: std::collections::HashMap<String, (SearchResult, f32)> =
             std::collections::HashMap::new();
 
+        // FTS ranking for hybrid retrieval (hoisted for use in final RRF sort)
+        let mut fts_ranking: Option<std::collections::HashMap<String, usize>> = None;
+
         // Search items table directly (for non-chunked items and chunked items)
         if let Some(table) = &self.items_table {
-            let query_builder = table
+            let row_count = table.count_rows(None).await.unwrap_or(0);
+            let base_query = table
                 .vector_search(query_embedding.clone())
-                .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?
-                .limit(limit * 2);
+                .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?;
+            let query_builder = if row_count < 5000 {
+                base_query.bypass_vector_index().limit(limit * 2)
+            } else {
+                base_query.refine_factor(10).limit(limit * 2)
+            };
 
             let results = query_builder
                 .execute()
@@ -778,6 +851,8 @@ impl Database {
                     SedimentError::Database(format!("Failed to collect results: {}", e))
                 })?;
 
+            // Collect vector search results with similarity scores
+            let mut vector_items: Vec<(Item, f32)> = Vec::new();
             for batch in results {
                 let items = batch_to_items(&batch)?;
                 let distances = batch
@@ -787,42 +862,50 @@ impl Database {
                 for (i, item) in items.into_iter().enumerate() {
                     let distance = distances.map(|d| d.value(i)).unwrap_or(0.0);
                     let similarity = 1.0 / (1.0 + distance);
-
-                    if similarity < min_similarity {
-                        continue;
+                    if similarity >= min_similarity {
+                        vector_items.push((item, similarity));
                     }
-
-                    // Apply project boosting
-                    let boosted_similarity = boost_similarity(
-                        similarity,
-                        item.project_id.as_deref(),
-                        self.project_id.as_deref(),
-                    );
-
-                    let result = SearchResult::from_item(&item, boosted_similarity);
-                    results_map
-                        .entry(item.id.clone())
-                        .or_insert((result, boosted_similarity));
                 }
+            }
+
+            // Run FTS search for keyword-based ranking signal
+            fts_ranking = self.fts_rank_items(table, query, limit * 2).await;
+
+            // Store items with project-boosted similarity (no FTS boost here;
+            // RRF fusion happens after chunks are merged)
+            for (item, similarity) in vector_items {
+                let boosted_similarity = boost_similarity(
+                    similarity,
+                    item.project_id.as_deref(),
+                    self.project_id.as_deref(),
+                );
+
+                let result = SearchResult::from_item(&item, boosted_similarity);
+                results_map
+                    .entry(item.id.clone())
+                    .or_insert((result, boosted_similarity));
             }
         }
 
         // Search chunks table (for chunked items)
         if let Some(chunks_table) = &self.chunks_table {
-            let chunk_results = chunks_table
-                .vector_search(query_embedding)
-                .map_err(|e| {
-                    SedimentError::Database(format!("Failed to build chunk search: {}", e))
-                })?
-                .limit(limit * 3)
-                .execute()
-                .await
-                .map_err(|e| SedimentError::Database(format!("Chunk search failed: {}", e)))?
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(|e| {
-                    SedimentError::Database(format!("Failed to collect chunk results: {}", e))
-                })?;
+            let chunk_row_count = chunks_table.count_rows(None).await.unwrap_or(0);
+            let chunk_base_query = chunks_table.vector_search(query_embedding).map_err(|e| {
+                SedimentError::Database(format!("Failed to build chunk search: {}", e))
+            })?;
+            let chunk_results = if chunk_row_count < 5000 {
+                chunk_base_query.bypass_vector_index().limit(limit * 3)
+            } else {
+                chunk_base_query.refine_factor(10).limit(limit * 3)
+            }
+            .execute()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Chunk search failed: {}", e)))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to collect chunk results: {}", e))
+            })?;
 
             // Group chunks by item and find best chunk for each item
             let mut chunk_matches: std::collections::HashMap<String, (String, f32)> =
@@ -882,15 +965,37 @@ impl Database {
             }
         }
 
-        // Convert map to sorted vec
-        let mut search_results: Vec<SearchResult> =
-            results_map.into_values().map(|(r, _)| r).collect();
-        search_results.sort_by(|a, b| {
-            b.similarity
-                .partial_cmp(&a.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        search_results.truncate(limit);
+        // Reciprocal Rank Fusion: combine vector similarity ranking with FTS ranking.
+        // RRF score = 1/(k + vector_rank) + 1/(k + fts_rank), where k=60 is the
+        // standard constant from Cormack et al. (2009). This replaces the previous
+        // hand-tuned additive boost with a principled rank fusion method.
+        const RRF_K: f32 = 60.0;
+
+        // Sort by similarity to assign vector ranks (0 = best)
+        let mut ranked: Vec<(SearchResult, f32)> = results_map.into_values().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Compute RRF scores
+        let mut rrf_scored: Vec<(SearchResult, f32)> = ranked
+            .into_iter()
+            .enumerate()
+            .map(|(vector_rank, (sr, _sim))| {
+                let vector_rrf = 1.0 / (RRF_K + vector_rank as f32);
+                let fts_rrf = fts_ranking.as_ref().map_or(0.0, |ranks| {
+                    ranks.get(&sr.id).map_or(0.0, |&r| 1.0 / (RRF_K + r as f32))
+                });
+                (sr, vector_rrf + fts_rrf)
+            })
+            .collect();
+
+        // Sort by RRF score for final ranking and truncation
+        rrf_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let search_results: Vec<SearchResult> = rrf_scored
+            .into_iter()
+            .take(limit)
+            .map(|(sr, _)| sr)
+            .collect();
 
         Ok(search_results)
     }
@@ -925,16 +1030,21 @@ impl Database {
             None => return Ok(Vec::new()),
         };
 
-        let results = table
+        let row_count = table.count_rows(None).await.unwrap_or(0);
+        let base_query = table
             .vector_search(embedding.to_vec())
-            .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?
-            .limit(limit)
-            .execute()
-            .await
-            .map_err(|e| SedimentError::Database(format!("Search failed: {}", e)))?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| SedimentError::Database(format!("Failed to collect results: {}", e)))?;
+            .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?;
+        let results = if row_count < 5000 {
+            base_query.bypass_vector_index().limit(limit)
+        } else {
+            base_query.refine_factor(10).limit(limit)
+        }
+        .execute()
+        .await
+        .map_err(|e| SedimentError::Database(format!("Search failed: {}", e)))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| SedimentError::Database(format!("Failed to collect results: {}", e)))?;
 
         let mut conflicts = Vec::new();
 

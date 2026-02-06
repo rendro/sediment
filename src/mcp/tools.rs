@@ -31,26 +31,44 @@ fn spawn_logged(name: &'static str, fut: impl std::future::Future<Output = ()> +
 
 /// Get all available tools (4 total)
 pub fn get_tools() -> Vec<Tool> {
+    let store_schema = {
+        #[allow(unused_mut)]
+        let mut props = json!({
+            "content": {
+                "type": "string",
+                "description": "The content to store"
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["project", "global"],
+                "default": "project",
+                "description": "Where to store: 'project' (current project) or 'global' (all projects)"
+            }
+        });
+
+        #[cfg(feature = "bench")]
+        {
+            props.as_object_mut().unwrap().insert(
+                "created_at".to_string(),
+                json!({
+                    "type": "number",
+                    "description": "Override creation timestamp (Unix seconds). Benchmark builds only."
+                }),
+            );
+        }
+
+        json!({
+            "type": "object",
+            "properties": props,
+            "required": ["content"]
+        })
+    };
+
     vec![
         Tool {
             name: "store".to_string(),
             description: "Store content for later retrieval. Use for preferences, facts, reference material, docs, or any information worth remembering. Long content is automatically chunked for better search.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": "The content to store"
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["project", "global"],
-                        "default": "project",
-                        "description": "Where to store: 'project' (current project) or 'global' (all projects)"
-                    }
-                },
-                "required": ["content"]
-            }),
+            input_schema: store_schema,
         },
         Tool {
             name: "recall".to_string(),
@@ -115,6 +133,10 @@ pub struct StoreParams {
     pub content: String,
     #[serde(default)]
     pub scope: Option<String>,
+    /// Override creation timestamp (Unix seconds). Benchmark builds only.
+    #[cfg(feature = "bench")]
+    #[serde(default)]
+    pub created_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +314,14 @@ async fn execute_store(
 
     // Build item
     let mut item = Item::new(&params.content);
+
+    // Override created_at if provided (benchmark builds only)
+    #[cfg(feature = "bench")]
+    if let Some(ts) = params.created_at {
+        if let Some(dt) = chrono::DateTime::from_timestamp(ts, 0) {
+            item = item.with_created_at(dt);
+        }
+    }
 
     // Set project_id based on scope
     if scope == StoreScope::Project

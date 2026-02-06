@@ -49,6 +49,13 @@ impl Item {
         self
     }
 
+    /// Override the creation timestamp (benchmark builds only)
+    #[cfg(feature = "bench")]
+    pub fn with_created_at(mut self, created_at: DateTime<Utc>) -> Self {
+        self.created_at = created_at;
+        self
+    }
+
     /// Mark as chunked
     pub fn with_chunked(mut self, is_chunked: bool) -> Self {
         self.is_chunked = is_chunked;
