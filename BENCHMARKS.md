@@ -1,38 +1,35 @@
 # Benchmarks
 
-Recall latency benchmarks at various database sizes, with and without graph features (backfill, expansion, co-access, decay scoring).
-
-Run benchmarks yourself:
-
-```bash
-cargo bench
-```
+Retrieval quality and latency compared against ChromaDB and Mem0, using 1,000 developer memories and 200 search queries. Full benchmark suite: [sediment-bench](https://github.com/rendro/sediment-bench).
 
 ## Results
 
-Measured on Apple M3 Max. Times are per-recall (single query, top-5 results, criterion.rs p50).
+Measured on Apple M3 Max, 36GB RAM.
 
-| DB Size | Graph Off | Graph On | Overhead |
-|---------|-----------|----------|----------|
-| 100     | ~12ms     | ~15ms    | 1.2x     |
-| 1,000   | ~36ms     | ~65ms    | 1.8x     |
+| Metric | Sediment | ChromaDB | Mem0 |
+|--------|----------|----------|------|
+| Recall@1 | 45.0% | 47.0% | 47.0% |
+| Recall@3 | **69.0%** | 69.0% | 69.0% |
+| Recall@5 | 78.0% | 78.5% | 78.5% |
+| Recall@10 | **90.5%** | 90.0% | 90.0% |
+| MRR | 59.0% | 60.8% | 60.8% |
+| Recency@1 | **100%** | 14% | 14% |
+| Consolidation | **99%** | 0% | 0% |
+| Store p50 | 22ms | 696ms | 16ms |
+| Recall p50 | 26ms | 694ms | 8ms |
 
-### What's measured
+## Key takeaways
 
-- **Graph Off**: Pure vector search + result formatting
-- **Graph On**: Vector search + decay scoring + graph backfill + 1-hop expansion + co-access suggestions
-
-### Key takeaways
-
-- Sub-16ms recall at 100 items with full graph features
-- Graph overhead scales with DB size: 1.2x at 100 items, 1.8x at 1K
-- Embedding computation dominates base latency (model inference is ~5ms per query)
-- All operations are local — no network round-trips
+- **Retrieval quality**: Within 0.5pp of ChromaDB on Recall@5 (78.0% vs 78.5%), matching on Recall@3
+- **Temporal correctness**: 100% Recency@1 — updated memories always rank first. Others: 14%
+- **Deduplication**: 99% consolidation rate — near-duplicates auto-merged. Others: 0%
+- **Latency**: 32x faster store than ChromaDB (22ms vs 696ms). All operations local, no network
 
 ## Methodology
 
-- Criterion.rs with 20 samples, 10s measurement time
-- Databases seeded with mixed content (short text, markdown, code)
-- ~30% of items have graph edges
-- Queries rotate through 5 representative search terms
-- Fresh DB connection per iteration (matches real-world MCP usage)
+- **Dataset**: 1,000 memories across 6 categories (architecture, code patterns, project facts, troubleshooting, user preferences, cross-project)
+- **Queries**: 200 queries with known ground-truth expected results
+- **Temporal**: 50 sequences testing whether updated information ranks above stale versions
+- **Dedup**: 50 pairs of near-duplicate content testing consolidation
+- **Baselines**: ChromaDB with default ONNX embeddings; Mem0 with local Qdrant + HuggingFace embeddings
+- **Sediment**: Hybrid vector + BM25 search, local Candle embeddings (all-MiniLM-L6-v2)
