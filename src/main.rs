@@ -332,10 +332,7 @@ fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let mut db = sediment::Database::open(&db_path).await?;
-        let filters = sediment::ItemFilters::default();
-        let items = db
-            .list_items(filters, Some(limit), sediment::ListScope::All)
-            .await?;
+        let items = db.list_items(Some(limit), sediment::ListScope::All).await?;
 
         if items.is_empty() {
             println!("No items stored.");

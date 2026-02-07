@@ -417,12 +417,12 @@ pub async fn recall_pipeline(
     // Lazy graph backfill (uses project_id from SearchResult, no extra queries)
     if config.enable_graph_backfill {
         for result in &results {
-            if let Err(e) = graph.ensure_node_exists(
+            if let Err(e) = graph.add_node(
                 &result.id,
                 result.project_id.as_deref(),
                 result.created_at.timestamp(),
             ) {
-                tracing::warn!("ensure_node_exists failed: {}", e);
+                tracing::warn!("graph backfill failed: {}", e);
             }
         }
     }
@@ -766,8 +766,6 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
 
     let limit = params.limit.unwrap_or(10).min(100);
 
-    let filters = ItemFilters::new();
-
     let scope = params
         .scope
         .as_deref()
@@ -779,7 +777,7 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
         Err(e) => return CallToolResult::error(e),
     };
 
-    match db.list_items(filters, Some(limit), scope).await {
+    match db.list_items(Some(limit), scope).await {
         Ok(items) => {
             if items.is_empty() {
                 CallToolResult::success("No items stored yet.")

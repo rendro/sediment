@@ -10,14 +10,6 @@ use rusqlite::{Connection, params};
 
 use crate::error::{Result, SedimentError};
 
-/// Record of access history for a single item.
-#[derive(Debug, Clone)]
-pub struct AccessRecord {
-    pub access_count: u32,
-    pub last_accessed_at: i64,
-    pub created_at: i64,
-}
-
 /// Combined access and validation data for decay scoring.
 #[derive(Debug, Clone)]
 pub struct DecayData {
@@ -100,19 +92,6 @@ impl AccessTracker {
                 SedimentError::Database(format!("Failed to record validation: {}", e))
             })?;
         Ok(())
-    }
-
-    /// Get validation count for an item.
-    pub fn get_validation_count(&self, item_id: &str) -> Result<u32> {
-        let count: u32 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(validation_count, 0) FROM access_log WHERE item_id = ?1",
-                params![item_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        Ok(count)
     }
 
     /// Get validation counts for multiple items in a single query.
@@ -209,6 +188,31 @@ impl AccessTracker {
         }
 
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+/// Record of access history for a single item.
+#[derive(Debug, Clone)]
+pub struct AccessRecord {
+    pub access_count: u32,
+    pub last_accessed_at: i64,
+    pub created_at: i64,
+}
+
+#[cfg(test)]
+impl AccessTracker {
+    /// Get validation count for an item.
+    pub fn get_validation_count(&self, item_id: &str) -> Result<u32> {
+        let count: u32 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(validation_count, 0) FROM access_log WHERE item_id = ?1",
+                params![item_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(count)
     }
 
     /// Get access records for a batch of item IDs.

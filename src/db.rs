@@ -1118,7 +1118,6 @@ impl Database {
     /// List items with optional filters
     pub async fn list_items(
         &mut self,
-        _filters: ItemFilters,
         limit: Option<usize>,
         scope: crate::ListScope,
     ) -> Result<Vec<Item>> {
@@ -2206,9 +2205,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = db
-            .list_items(ItemFilters::new(), Some(10), crate::ListScope::Project)
-            .await;
+        let result = db.list_items(Some(10), crate::ListScope::Project).await;
 
         assert!(result.is_err(), "Should reject invalid project_id");
         let err_msg = result.unwrap_err().to_string();

@@ -124,11 +124,6 @@ pub fn central_db_path() -> PathBuf {
         .join("data")
 }
 
-/// Get the default global database path (alias for central_db_path for backwards compatibility)
-pub fn default_db_path() -> PathBuf {
-    central_db_path()
-}
-
 /// Project configuration stored in `.sediment/config`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {

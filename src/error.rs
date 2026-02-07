@@ -17,14 +17,8 @@ pub enum SedimentError {
     #[error("Embedding error: {0}")]
     Embedding(String),
 
-    #[error("Search error: {0}")]
-    Search(String),
-
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("Item not found: {0}")]
-    NotFound(String),
 
     #[error("Invalid content type: {0}")]
     InvalidContentType(String),

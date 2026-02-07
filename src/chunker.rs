@@ -32,14 +32,6 @@ impl Default for ChunkingConfig {
     }
 }
 
-impl ChunkingConfig {
-    /// Create config with legacy field name for backwards compatibility
-    pub fn with_chunk_size(mut self, size: usize) -> Self {
-        self.max_chunk_size = size;
-        self
-    }
-}
-
 /// Result of chunking a piece of content
 #[derive(Debug, Clone)]
 pub struct ChunkResult {
@@ -710,8 +702,7 @@ fn extract_code_context(line: &str) -> String {
     // For function definitions, get up to the opening brace or paren
     if let Some(paren_pos) = trimmed.find('(') {
         let signature = &trimmed[..paren_pos];
-        // Find the last word (likely the function name)
-        if signature.rfind(' ').is_some() {
+        if signature.contains(' ') {
             return format!("{}...", &trimmed[..paren_pos.min(60)]);
         }
     }

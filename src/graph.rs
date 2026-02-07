@@ -10,30 +10,6 @@ use tracing::debug;
 
 use crate::error::{Result, SedimentError};
 
-/// A relationship between two memory items in the graph.
-#[derive(Debug, Clone)]
-pub struct Edge {
-    pub target_id: String,
-    pub rel_type: String,
-    pub strength: f64,
-}
-
-/// A co-access relationship between two memory items.
-#[derive(Debug, Clone)]
-pub struct CoAccessEdge {
-    pub target_id: String,
-    pub count: i64,
-}
-
-/// Full connection info for a memory item.
-#[derive(Debug, Clone)]
-pub struct ConnectionInfo {
-    pub target_id: String,
-    pub rel_type: String,
-    pub strength: f64,
-    pub count: Option<i64>,
-}
-
 /// SQLite-backed graph store for memory relationships.
 pub struct GraphStore {
     conn: Connection,
@@ -91,16 +67,6 @@ impl GraphStore {
 
         debug!("Added graph node: {}", id);
         Ok(())
-    }
-
-    /// Ensure a node exists in the graph. Creates it if missing (for backfill).
-    pub fn ensure_node_exists(
-        &self,
-        id: &str,
-        project_id: Option<&str>,
-        created_at: i64,
-    ) -> Result<()> {
-        self.add_node(id, project_id, created_at)
     }
 
     /// Remove a Memory node and all its edges from the graph.
@@ -416,63 +382,6 @@ impl GraphStore {
         Ok(clusters)
     }
 
-    /// Get full connection info for an item (all edge types).
-    pub fn get_full_connections(&self, item_id: &str) -> Result<Vec<ConnectionInfo>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT
-                CASE WHEN from_id = ?1 THEN to_id ELSE from_id END AS neighbor,
-                edge_type,
-                strength,
-                rel_type,
-                count
-             FROM graph_edges
-             WHERE from_id = ?1 OR to_id = ?1",
-            )
-            .map_err(|e| {
-                SedimentError::Database(format!("Failed to prepare connections query: {}", e))
-            })?;
-
-        let rows = stmt
-            .query_map(params![item_id], |row| {
-                let neighbor: String = row.get(0)?;
-                let edge_type: String = row.get(1)?;
-                let strength: f64 = row.get(2)?;
-                let rel_type_val: String = row.get(3)?;
-                let count: i64 = row.get(4)?;
-
-                let display_type = match edge_type.as_str() {
-                    "related" => rel_type_val.clone(),
-                    "supersedes" => "supersedes".to_string(),
-                    "co_accessed" => "co_accessed".to_string(),
-                    _ => edge_type.clone(),
-                };
-
-                Ok(ConnectionInfo {
-                    target_id: neighbor,
-                    rel_type: display_type,
-                    strength,
-                    count: if edge_type == "co_accessed" {
-                        Some(count)
-                    } else {
-                        None
-                    },
-                })
-            })
-            .map_err(|e| SedimentError::Database(format!("Failed to query connections: {}", e)))?;
-
-        let mut connections = Vec::new();
-        for row in rows {
-            let r = row.map_err(|e| {
-                SedimentError::Database(format!("Failed to read connection: {}", e))
-            })?;
-            connections.push(r);
-        }
-
-        Ok(connections)
-    }
-
     /// Get 1-hop neighbors grouped by source ID.
     ///
     /// For each input ID, returns a list of neighbor IDs from RELATED or SUPERSEDES edges.
@@ -614,26 +523,86 @@ impl GraphStore {
         }
         Ok(updated)
     }
-
-    /// Get the edge count for an item (total number of edges of all types).
-    pub fn get_edge_count(&self, item_id: &str) -> Result<u32> {
-        let count: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM graph_edges WHERE from_id = ?1 OR to_id = ?1",
-                params![item_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| SedimentError::Database(format!("Failed to count edges: {}", e)))?;
-
-        Ok(count as u32)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[derive(Debug, Clone)]
+    #[allow(dead_code)]
+    struct ConnectionInfo {
+        target_id: String,
+        rel_type: String,
+        strength: f64,
+        count: Option<i64>,
+    }
+
+    impl GraphStore {
+        fn get_full_connections(&self, item_id: &str) -> Result<Vec<ConnectionInfo>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT
+                    CASE WHEN from_id = ?1 THEN to_id ELSE from_id END AS neighbor,
+                    edge_type, strength, rel_type, count
+                 FROM graph_edges WHERE from_id = ?1 OR to_id = ?1",
+                )
+                .map_err(|e| {
+                    SedimentError::Database(format!("Failed to prepare connections query: {}", e))
+                })?;
+
+            let rows = stmt
+                .query_map(params![item_id], |row| {
+                    let neighbor: String = row.get(0)?;
+                    let edge_type: String = row.get(1)?;
+                    let strength: f64 = row.get(2)?;
+                    let rel_type_val: String = row.get(3)?;
+                    let count: i64 = row.get(4)?;
+                    let display_type = match edge_type.as_str() {
+                        "related" => rel_type_val.clone(),
+                        "supersedes" => "supersedes".to_string(),
+                        "co_accessed" => "co_accessed".to_string(),
+                        _ => edge_type.clone(),
+                    };
+                    Ok(ConnectionInfo {
+                        target_id: neighbor,
+                        rel_type: display_type,
+                        strength,
+                        count: if edge_type == "co_accessed" {
+                            Some(count)
+                        } else {
+                            None
+                        },
+                    })
+                })
+                .map_err(|e| {
+                    SedimentError::Database(format!("Failed to query connections: {}", e))
+                })?;
+
+            let mut connections = Vec::new();
+            for row in rows {
+                let r = row.map_err(|e| {
+                    SedimentError::Database(format!("Failed to read connection: {}", e))
+                })?;
+                connections.push(r);
+            }
+            Ok(connections)
+        }
+
+        fn get_edge_count(&self, item_id: &str) -> Result<u32> {
+            let count: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM graph_edges WHERE from_id = ?1 OR to_id = ?1",
+                    params![item_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| SedimentError::Database(format!("Failed to count edges: {}", e)))?;
+            Ok(count as u32)
+        }
+    }
 
     fn open_test_graph() -> GraphStore {
         let tmp = NamedTempFile::new().unwrap();

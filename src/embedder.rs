@@ -26,7 +26,6 @@ pub struct Embedder {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
-    normalize: bool,
 }
 
 impl Embedder {
@@ -86,7 +85,6 @@ impl Embedder {
             model,
             tokenizer,
             device,
-            normalize: true,
         })
     }
 
@@ -178,12 +176,8 @@ impl Embedder {
             .broadcast_div(&sum_mask)
             .map_err(|e| SedimentError::Embedding(format!("Division failed: {}", e)))?;
 
-        // Normalize if requested
-        let final_embeddings = if self.normalize {
-            normalize_l2(&mean_embeddings)?
-        } else {
-            mean_embeddings
-        };
+        // L2 normalize embeddings
+        let final_embeddings = normalize_l2(&mean_embeddings)?;
 
         // Convert to Vec<Vec<f32>>
         let embeddings_vec: Vec<Vec<f32>> = final_embeddings

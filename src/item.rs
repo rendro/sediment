@@ -43,29 +43,10 @@ impl Item {
         self
     }
 
-    /// Set the embedding. Panics if dimensions don't match [`EMBEDDING_DIM`](crate::EMBEDDING_DIM).
-    pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
-        assert_eq!(
-            embedding.len(),
-            crate::embedder::EMBEDDING_DIM,
-            "embedding dimension mismatch: expected {}, got {}",
-            crate::embedder::EMBEDDING_DIM,
-            embedding.len()
-        );
-        self.embedding = embedding;
-        self
-    }
-
     /// Override the creation timestamp (benchmark builds only)
     #[cfg(feature = "bench")]
     pub fn with_created_at(mut self, created_at: DateTime<Utc>) -> Self {
         self.created_at = created_at;
-        self
-    }
-
-    /// Mark as chunked
-    pub fn with_chunked(mut self, is_chunked: bool) -> Self {
-        self.is_chunked = is_chunked;
         self
     }
 
@@ -116,19 +97,6 @@ impl Chunk {
     /// Set context
     pub fn with_context(mut self, context: impl Into<String>) -> Self {
         self.context = Some(context.into());
-        self
-    }
-
-    /// Set the embedding. Panics if dimensions don't match [`EMBEDDING_DIM`](crate::EMBEDDING_DIM).
-    pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
-        assert_eq!(
-            embedding.len(),
-            crate::embedder::EMBEDDING_DIM,
-            "embedding dimension mismatch: expected {}, got {}",
-            crate::embedder::EMBEDDING_DIM,
-            embedding.len()
-        );
-        self.embedding = embedding;
         self
     }
 }
@@ -212,9 +180,13 @@ impl ItemFilters {
     pub fn new() -> Self {
         Self::default()
     }
+}
 
-    pub fn with_min_similarity(mut self, min_similarity: f32) -> Self {
-        self.min_similarity = Some(min_similarity);
+#[cfg(test)]
+impl Item {
+    /// Mark as chunked (test only)
+    pub fn with_chunked(mut self, is_chunked: bool) -> Self {
+        self.is_chunked = is_chunked;
         self
     }
 }
