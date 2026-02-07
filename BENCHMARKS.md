@@ -1,6 +1,6 @@
 # Benchmarks
 
-Retrieval quality and latency compared against ChromaDB and Mem0, using 1,000 developer memories and 200 search queries. Full benchmark suite: [sediment-bench](https://github.com/rendro/sediment-bench).
+Retrieval quality and latency compared against ChromaDB and Mem0, using 1,000 developer memories and 200 search queries. Full benchmark suite: [sediment-benchmark](https://github.com/rendro/sediment-benchmark).
 
 ## Results
 
