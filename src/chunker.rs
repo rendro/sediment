@@ -37,9 +37,9 @@ impl Default for ChunkingConfig {
 pub struct ChunkResult {
     /// The chunk content
     pub content: String,
-    /// Start offset in original content (character position)
+    /// Start byte offset in original content
     pub start_offset: usize,
-    /// End offset in original content (character position)
+    /// End byte offset in original content
     pub end_offset: usize,
     /// Optional context (e.g., parent header for markdown)
     pub context: Option<String>,
