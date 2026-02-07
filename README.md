@@ -160,7 +160,8 @@ All local, embedded, zero config:
 
 - **Memory decay**: Results re-ranked by freshness (30-day half-life) and access frequency. Old memories rank lower but are never auto-deleted.
 - **Trust-weighted scoring**: Validated and well-connected memories score higher.
-- **Project scoping**: Automatic context isolation between projects. Same-project items get a similarity boost.
+- **Hybrid search**: Vector similarity combined with FTS/BM25 scoring for better retrieval quality.
+- **Project scoping**: Automatic context isolation between projects. Different-project items receive a similarity penalty.
 - **Relationship graph**: Items linked via RELATED, SUPERSEDES, and CO_ACCESSED edges. Recall expands results with 1-hop graph neighbors and co-access suggestions.
 - **Background consolidation**: Near-duplicates (≥0.95 similarity) auto-merged; similar items (0.85–0.95) linked.
 - **Type-aware chunking**: Intelligent splitting for markdown, code, JSON, YAML, and plain text.

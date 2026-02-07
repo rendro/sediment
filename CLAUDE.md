@@ -39,13 +39,17 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 ### Core Components
 
 - **`src/main.rs`** - CLI entry point with subcommands (init, stats, list) and MCP server startup
-- **`src/lib.rs`** - Library root exposing public API, project detection, and scope types
-- **`src/db.rs`** - LanceDB wrapper handling vector storage, search, and CRUD operations
+- **`src/lib.rs`** - Library root exposing public API, project detection, scope types, and project ID migration
+- **`src/db.rs`** - LanceDB wrapper handling vector storage, hybrid search (vector + FTS/BM25), and CRUD operations
 - **`src/embedder.rs`** - Local embeddings using `all-MiniLM-L6-v2` via Candle (384-dim vectors)
 - **`src/chunker.rs`** - Smart content chunking by type (markdown, code, JSON, YAML, text)
+- **`src/document.rs`** - ContentType enum for routing content to the appropriate chunker
+- **`src/item.rs`** - Unified Item, Chunk, SearchResult, StoreResult, and ConflictInfo types
 - **`src/access.rs`** - SQLite-based access tracking, validation counting, and memory decay scoring
 - **`src/graph.rs`** - SQLite graph store: relationship tracking (RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING edges)
 - **`src/consolidation.rs`** - Background consolidation: auto-merging near-duplicates, linking similar items
+- **`src/error.rs`** - SedimentError enum with typed error variants (Database, Embedding, Arrow, etc.)
+- **`src/retry.rs`** - Retry utilities with exponential backoff (3 attempts, 100ms–2s)
 
 ### MCP Server (`src/mcp/`)
 
@@ -67,7 +71,8 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 - **Two-database hybrid**: LanceDB for vectors, SQLite for graph relationships + mutable counters
 - **Single central database** at `~/.sediment/data/` stores all projects; graph + access at `~/.sediment/access.db`
 - **Project scoping** via UUID stored in `.sediment/config` per project
-- **Similarity boosting**: Same-project items get 1.15x boost, different projects 0.95x penalty
+- **Similarity boosting**: Same-project items unchanged, different projects get 0.875x penalty (12.5% spread)
+- **Hybrid search**: Vector similarity combined with FTS/BM25 scoring. BM25 boost is additive (max 0.12, power-law gamma 2.0). FTS index rebuilt on each store
 - **Conflict detection**: Items with >=0.85 similarity flagged on store and enqueued for consolidation
 - **Fresh DB connection per tool call** with shared embedder for efficiency
 - **Memory decay scoring**: Recall results re-ranked using freshness (hyperbolic decay, 0.5 at 30 days) and access frequency (log-scaled). Tracked in SQLite sidecar since LanceDB is append-oriented.
@@ -126,6 +131,8 @@ CREATE TABLE graph_edges (
     created_at INTEGER NOT NULL,
     UNIQUE(from_id, to_id, edge_type)
 );
+CREATE INDEX idx_edges_from ON graph_edges(from_id, edge_type);
+CREATE INDEX idx_edges_to ON graph_edges(to_id, edge_type);
 
 -- Access tracking and decay scoring
 CREATE TABLE access_log (
