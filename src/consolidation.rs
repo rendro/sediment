@@ -286,9 +286,15 @@ async fn process_candidate(
                     tracing::warn!("transfer_edges failed: {}", e);
                 }
 
-                // Create SUPERSEDES edge (preserves lineage for recovery)
+                // Create SUPERSEDES edge (preserves lineage for recovery).
+                // This MUST succeed before we delete — without it the removed
+                // item's lineage is lost and content is irrecoverable.
                 if let Err(e) = graph.add_supersedes_edge(&keep.id, &remove.id) {
-                    tracing::warn!("add_supersedes_edge failed: {}", e);
+                    tracing::warn!(
+                        "add_supersedes_edge failed, aborting merge to prevent data loss: {}",
+                        e
+                    );
+                    return Ok("linked".to_string());
                 }
 
                 // Archive the removed item's content into a RELATED edge label
@@ -312,10 +318,10 @@ async fn process_candidate(
                     fresh_similarity,
                     &format!("merged_archive:{}", archive_preview),
                 ) {
-                    tracing::warn!("add_related_edge failed: {}", e);
+                    tracing::warn!("add_related_edge (archive) failed: {}", e);
                 }
 
-                // Delete the duplicate item
+                // Delete the duplicate item (safe: supersedes edge preserves lineage)
                 if let Err(e) = db.delete_item(&remove.id).await {
                     warn!("delete_item failed: {}", e);
                 }

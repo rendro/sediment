@@ -1271,19 +1271,23 @@ impl Database {
             return Ok(false);
         }
 
-        // Delete chunks first
-        if let Some(chunks_table) = &self.chunks_table {
-            chunks_table
-                .delete(&format!("item_id = '{}'", sanitize_sql_string(id)))
-                .await
-                .map_err(|e| SedimentError::Database(format!("Delete chunks failed: {}", e)))?;
-        }
-
-        // Delete item
+        // Delete item first — if this fails, chunks remain valid.
+        // Reversing the order avoids leaving an is_chunked=true item with
+        // no chunks, which would produce incorrect search results.
         table
             .delete(&format!("id = '{}'", sanitize_sql_string(id)))
             .await
             .map_err(|e| SedimentError::Database(format!("Delete failed: {}", e)))?;
+
+        // Delete orphaned chunks (best-effort — orphaned chunks are benign
+        // since they are only found via item_id join on the now-deleted item).
+        if let Some(chunks_table) = &self.chunks_table
+            && let Err(e) = chunks_table
+                .delete(&format!("item_id = '{}'", sanitize_sql_string(id)))
+                .await
+        {
+            tracing::warn!("Failed to delete chunks for item {}: {}", id, e);
+        }
 
         Ok(true)
     }

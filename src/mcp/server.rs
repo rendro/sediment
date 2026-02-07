@@ -116,11 +116,14 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
                 // malicious client that never sends a newline.
                 if !line.ends_with('\n') {
                     let mut drain_buf = [0u8; 8192];
+                    let mut drained = 0usize;
+                    const MAX_DRAIN_BYTES: usize = 100 * 1024 * 1024; // 100 MB
                     loop {
                         match reader.read(&mut drain_buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                if drain_buf[..n].contains(&b'\n') {
+                                drained += n;
+                                if drain_buf[..n].contains(&b'\n') || drained >= MAX_DRAIN_BYTES {
                                     break;
                                 }
                             }

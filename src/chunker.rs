@@ -405,8 +405,13 @@ fn find_overlap_start_bytes(bytes: &[u8], target_overlap: usize) -> usize {
         }
     }
 
-    // Fall back to target position
-    bytes.len().saturating_sub(target_overlap)
+    // Fall back to target position, snapping forward to a valid char boundary
+    // to avoid panicking on multi-byte characters (continuation bytes: 10xxxxxx).
+    let mut pos = bytes.len().saturating_sub(target_overlap);
+    while pos < bytes.len() && bytes[pos] & 0xC0 == 0x80 {
+        pos += 1;
+    }
+    pos
 }
 
 /// Enforce max size on all chunks by recursive splitting
