@@ -18,9 +18,10 @@ pub const EMBEDDING_DIM: usize = 384;
 /// Each variant carries model metadata: HF repo ID, pinned revision,
 /// SHA-256 hashes for integrity verification, and prefix functions
 /// for asymmetric query/document embedding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EmbeddingModel {
     /// sentence-transformers/all-MiniLM-L6-v2 (default, no prefixes, 384-dim)
+    #[default]
     AllMiniLmL6V2,
     /// intfloat/e5-small-v2 (query: "query: {text}", document: "passage: {text}", 384-dim)
     E5SmallV2,
@@ -136,12 +137,6 @@ impl EmbeddingModel {
             "bge-base-en-v1.5" => Some(Self::BgeBaseEnV15),
             _ => None,
         }
-    }
-}
-
-impl Default for EmbeddingModel {
-    fn default() -> Self {
-        Self::AllMiniLmL6V2
     }
 }
 
