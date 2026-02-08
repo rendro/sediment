@@ -1,6 +1,6 @@
 [package]
 name = "sediment-mcp"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 repository = "https://github.com/rendro/sediment"
 homepage = "https://github.com/rendro/sediment"
