@@ -11,20 +11,20 @@ Combines vector search, a relationship graph, and access tracking into a unified
 ## Why Sediment?
 
 - **Single binary, zero config** — no Docker, no Postgres, no Qdrant. Just `sediment`.
-- **Sub-16ms recall** — local embeddings and vector search at 100 items, no network round-trips.
+- **50ms store, 103ms recall** — local embeddings and vector search at 1K items, no network round-trips.
 - **4-tool focused API** — `store`, `recall`, `list`, `forget`. That's it.
 - **Works everywhere** — macOS (Intel + ARM), Linux x86_64. All data stays on your machine.
 
 ### Comparison
 
-| | Sediment | OpenMemory MCP | mcp-memory-service |
-|---|---|---|---|
-| Install | Single binary | Docker + Postgres + Qdrant | Python + pip |
-| Dependencies | None | 3 services | Python runtime + deps |
-| Tools | 4 | 10+ | 24 |
-| Embeddings | Local (all-MiniLM-L6-v2) | API-dependent | API-dependent |
-| Graph features | Built-in | No | No |
-| Memory decay | Built-in | No | No |
+| | Sediment | ChromaDB | Mem0 | MCP Memory Svc |
+|---|---|---|---|---|
+| Install | Single binary | Python + pip | Docker + Postgres + Qdrant | Python + pip |
+| Tools | 4 | API | 4 | 12 |
+| R@1 | **50%** | 47% | 47% | 38% |
+| Recency@1 | **100%** | 14% | 14% | 10% |
+| Dedup | **99%** | 0% | 0% | 0% |
+| Store p50 | 50ms | 692ms | 14ms | 2ms |
 
 ## Install
 
@@ -182,12 +182,16 @@ All local, embedded, zero config:
 
 ## Performance
 
-Sub-16ms recall at 100 items with full graph features enabled. See [BENCHMARKS.md](BENCHMARKS.md) for detailed numbers.
+Benchmarked against 5 alternatives with 1,000 memories and 200 queries. See [BENCHMARKS.md](BENCHMARKS.md) for full results.
 
-| DB Size | Graph Off | Graph On |
-|---------|-----------|----------|
-| 100     | ~12ms     | ~15ms    |
-| 1,000   | ~36ms     | ~65ms   |
+| Metric | Sediment | ChromaDB | Mem0 |
+|--------|----------|----------|------|
+| R@1 | **50%** | 47% | 47% |
+| MRR | **62%** | 61% | 61% |
+| Recency@1 | **100%** | 14% | 14% |
+| Dedup | **99%** | 0% | 0% |
+| Store p50 | 50ms | 692ms | 14ms |
+| Recall p50 | 103ms | 694ms | 8ms |
 
 ### Data Location
 
