@@ -1,30 +1,46 @@
 # Benchmarks
 
-Retrieval quality and latency compared against ChromaDB and Mem0, using 1,000 developer memories and 200 search queries. Full benchmark suite: [sediment-benchmark](https://github.com/rendro/sediment-benchmark).
+Retrieval quality and latency compared against five MCP memory systems, using 1,000 developer memories and 200 search queries. Full benchmark suite: [sediment-benchmark](https://github.com/rendro/sediment-benchmark).
 
 ## Results
 
 Measured on Apple M3 Max, 36GB RAM.
 
-| Metric | Sediment | ChromaDB | Mem0 |
-|--------|----------|----------|------|
-| Recall@1 | **50.0%** | 47.0% | 47.0% |
-| Recall@3 | 69.0% | 69.0% | 69.0% |
-| Recall@5 | 77.5% | 78.5% | 78.5% |
-| Recall@10 | 89.5% | 90.0% | 90.0% |
-| MRR | **61.9%** | 60.8% | 60.8% |
-| nDCG@5 | 58.7% | 59.9% | 59.9% |
-| Recency@1 | **100%** | 14% | 14% |
-| Consolidation | **99%** | 0% | 0% |
-| Store p50 | 49ms | 696ms | 16ms |
-| Recall p50 | 103ms | 694ms | 8ms |
+| Metric | Sediment | ChromaDB | Mem0 | MCP Memory Service | MCP Server Memory | Basic Memory |
+|--------|----------|----------|------|--------------------|--------------------|-------------|
+| Recall@1 | **50.0%** | 47.0% | 47.0% | 38.0% | 1.0% | 9.0% |
+| Recall@5 | 77.5% | **78.5%** | **78.5%** | 66.0% | 2.0% | 11.5% |
+| MRR | **61.9%** | 60.8% | 60.8% | 49.0% | 1.5% | 10.2% |
+| nDCG@5 | 58.7% | **59.9%** | **59.9%** | 47.8% | 1.6% | 10.4% |
+| Recency@1 | **100%** | 14% | 14% | 10% | 0% | 0% |
+| Consolidation | **99%** | 0% | 0% | 0% | 0% | 0% |
+| Store p50 | 50ms | 692ms | 14ms | **2ms** | **2ms** | 49ms |
+| Recall p50 | 103ms | 694ms | **8ms** | 10ms | **2ms** | 28ms |
+
+MCP Server Memory and Basic Memory use keyword/entity matching rather than vector search, which explains their low retrieval scores on semantic queries.
 
 ## Key takeaways
 
-- **Retrieval quality**: Best R@1 (50.0%) and MRR (61.9%) — top result is correct more often than alternatives
-- **Temporal correctness**: 100% Recency@1 — updated memories always rank first. Others: 14%
-- **Deduplication**: 99% consolidation rate — near-duplicates auto-merged. Others: 0%
-- **Latency**: 14x faster store than ChromaDB (49ms vs 696ms). All operations local, no network
+- **Retrieval quality**: Best R@1 (50.0%) and MRR (61.9%) among all systems — top result is correct more often than alternatives
+- **Temporal correctness**: 100% Recency@1 — updated memories always rank first. Best competitor: 14%
+- **Deduplication**: 99% consolidation rate — near-duplicates auto-merged. All others: 0%
+- **Latency**: 14x faster store than ChromaDB (50ms vs 692ms). All operations local, no network
+
+## Embedding model comparison
+
+Sediment supports multiple embedding models via the `SEDIMENT_EMBEDDING_MODEL` environment variable. All models achieve 100% temporal correctness and 99% dedup consolidation.
+
+| Metric | all-MiniLM-L6-v2 (default) | bge-base-en-v1.5 | bge-small-en-v1.5 | e5-small-v2 |
+|--------|---------------------------|-------------------|-------------------|-------------|
+| Dimensions | 384 | 768 | 384 | 384 |
+| Recall@1 | 50.0% | **50.5%** | 46.5% | 42.0% |
+| Recall@5 | **77.5%** | 76.0% | 75.0% | 68.0% |
+| MRR | 61.9% | **62.0%** | 58.4% | 53.5% |
+| nDCG@5 | **58.7%** | 57.6% | 55.5% | 51.1% |
+| Store p50 | **50ms** | 92ms | 64ms | 63ms |
+| Recall p50 | **103ms** | 149ms | 120ms | 118ms |
+
+all-MiniLM-L6-v2 remains the default: essentially tied with bge-base-en-v1.5 on quality but ~2x faster due to smaller dimensions (384 vs 768).
 
 ## Category breakdown
 
@@ -65,17 +81,17 @@ Measured on Apple M3 Max, 36GB RAM.
 
 | Metric | Sediment | ChromaDB | Mem0 |
 |--------|----------|----------|------|
-| p50 | 49ms | 696ms | **16ms** |
-| p95 | 62ms | 726ms | **19ms** |
-| p99 | 88ms | 729ms | **20ms** |
+| p50 | 50ms | 692ms | **14ms** |
+| p95 | 63ms | 726ms | **19ms** |
+| p99 | 65ms | 729ms | **20ms** |
 
 ### Recall latency
 
 | Metric | Sediment | ChromaDB | Mem0 |
 |--------|----------|----------|------|
 | p50 | 103ms | 694ms | **8ms** |
-| p95 | 109ms | 728ms | **12ms** |
-| p99 | 132ms | 746ms | **12ms** |
+| p95 | 110ms | 728ms | **12ms** |
+| p99 | 124ms | 746ms | **12ms** |
 
 ## Methodology
 
@@ -83,5 +99,4 @@ Measured on Apple M3 Max, 36GB RAM.
 - **Queries**: 200 queries with known ground-truth expected results
 - **Temporal**: 50 sequences testing whether updated information ranks above stale versions
 - **Dedup**: 50 pairs of near-duplicate content testing consolidation
-- **Baselines**: ChromaDB with default ONNX embeddings; Mem0 with local Qdrant + HuggingFace embeddings
-- **Sediment**: Hybrid vector + BM25 search, local Candle embeddings (all-MiniLM-L6-v2)
+- **Systems tested**: Sediment (hybrid vector + BM25, local Candle embeddings), ChromaDB (default ONNX embeddings), Mem0 (local Qdrant + HuggingFace), MCP Memory Service (ChromaDB-based), MCP Server Memory (entity graph), Basic Memory (markdown file-based)

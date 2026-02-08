@@ -30,7 +30,7 @@ pub mod retry;
 pub use chunker::{ChunkResult, ChunkingConfig, chunk_content};
 pub use db::Database;
 pub use document::ContentType;
-pub use embedder::{EMBEDDING_DIM, Embedder};
+pub use embedder::{EMBEDDING_DIM, Embedder, EmbeddingModel};
 pub use error::{Result, SedimentError};
 pub use item::{Chunk, ConflictInfo, Item, ItemFilters, SearchResult, StoreResult};
 pub use retry::{RetryConfig, with_retry};

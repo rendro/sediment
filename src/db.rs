@@ -48,7 +48,7 @@ use tracing::{debug, info};
 use crate::boost_similarity;
 use crate::chunker::{ChunkingConfig, chunk_content};
 use crate::document::ContentType;
-use crate::embedder::{EMBEDDING_DIM, Embedder};
+use crate::embedder::Embedder;
 use crate::error::{Result, SedimentError};
 use crate::item::{Chunk, ConflictInfo, Item, ItemFilters, SearchResult, StoreResult};
 
@@ -109,7 +109,7 @@ pub struct DatabaseStats {
 const SCHEMA_VERSION: i32 = 2;
 
 // Arrow schema builders
-fn item_schema() -> Schema {
+fn item_schema(dim: usize) -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, false),
@@ -120,14 +120,14 @@ fn item_schema() -> Schema {
             "vector",
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
-                EMBEDDING_DIM as i32,
+                dim as i32,
             ),
             false,
         ),
     ])
 }
 
-fn chunk_schema() -> Schema {
+fn chunk_schema(dim: usize) -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("item_id", DataType::Utf8, false),
@@ -138,7 +138,7 @@ fn chunk_schema() -> Schema {
             "vector",
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
-                EMBEDDING_DIM as i32,
+                dim as i32,
             ),
             false,
         ),
@@ -335,7 +335,8 @@ impl Database {
                 .await
                 .map_err(|e| SedimentError::Database(format!("Recovery collect failed: {}", e)))?;
 
-            let schema = Arc::new(item_schema());
+            let dim = self.embedder.dimension();
+            let schema = Arc::new(item_schema(dim));
             let new_table = self
                 .db
                 .create_empty_table("items", schema.clone())
@@ -448,7 +449,8 @@ impl Database {
         }
 
         // Step 5: Create staging table with migrated data
-        let schema = Arc::new(item_schema());
+        let dim = self.embedder.dimension();
+        let schema = Arc::new(item_schema(dim));
         let staging_table = self
             .db
             .create_empty_table("items_migrated", schema.clone())
@@ -530,7 +532,7 @@ impl Database {
 
     /// Convert a batch from old schema to new schema
     fn convert_batch_to_new_schema(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let schema = Arc::new(item_schema());
+        let schema = Arc::new(item_schema(self.embedder.dimension()));
 
         // Extract columns from old batch (handle missing columns gracefully)
         let id_col = batch
@@ -645,7 +647,7 @@ impl Database {
     /// Get or create the items table
     async fn get_items_table(&mut self) -> Result<&Table> {
         if self.items_table.is_none() {
-            let schema = Arc::new(item_schema());
+            let schema = Arc::new(item_schema(self.embedder.dimension()));
             let table = self
                 .db
                 .create_empty_table("items", schema)
@@ -662,7 +664,7 @@ impl Database {
     /// Get or create the chunks table
     async fn get_chunks_table(&mut self) -> Result<&Table> {
         if self.chunks_table.is_none() {
-            let schema = Arc::new(chunk_schema());
+            let schema = Arc::new(chunk_schema(self.embedder.dimension()));
             let table = self
                 .db
                 .create_empty_table("chunks", schema)
@@ -695,13 +697,14 @@ impl Database {
 
         // Generate item embedding
         let embedding_text = item.embedding_text();
-        let embedding = self.embedder.embed(&embedding_text)?;
+        let embedding = self.embedder.embed_document(&embedding_text)?;
         item.embedding = embedding;
 
         // Store the item
         let table = self.get_items_table().await?;
         let batch = item_to_batch(&item)?;
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], Arc::new(item_schema()));
+        let batches =
+            RecordBatchIterator::new(vec![Ok(batch)], Arc::new(item_schema(item.embedding.len())));
 
         table
             .add(Box::new(batches))
@@ -772,7 +775,8 @@ impl Database {
         let mut all_embeddings = Vec::with_capacity(chunk_texts.len());
         for batch_start in (0..chunk_texts.len()).step_by(EMBEDDING_BATCH_SIZE) {
             let batch_end = (batch_start + EMBEDDING_BATCH_SIZE).min(chunk_texts.len());
-            let batch_embeddings = embedder.embed_batch(&chunk_texts[batch_start..batch_end])?;
+            let batch_embeddings =
+                embedder.embed_document_batch(&chunk_texts[batch_start..batch_end])?;
             all_embeddings.extend(batch_embeddings);
         }
 
@@ -789,7 +793,7 @@ impl Database {
 
         // Single LanceDB write for all chunks
         if !all_chunk_batches.is_empty() {
-            let schema = Arc::new(chunk_schema());
+            let schema = Arc::new(chunk_schema(embedder.dimension()));
             let batches = RecordBatchIterator::new(all_chunk_batches.into_iter().map(Ok), schema);
             chunks_table
                 .add(Box::new(batches))
@@ -854,7 +858,7 @@ impl Database {
         self.ensure_vector_index().await?;
 
         // Generate query embedding
-        let query_embedding = self.embedder.embed(query)?;
+        let query_embedding = self.embedder.embed_query(query)?;
         let min_similarity = filters.min_similarity.unwrap_or(0.3);
 
         // We need to search both items and chunks, then merge results
@@ -1043,7 +1047,7 @@ impl Database {
         min_similarity: f32,
         limit: usize,
     ) -> Result<Vec<ConflictInfo>> {
-        let embedding = self.embedder.embed(content)?;
+        let embedding = self.embedder.embed_document(content)?;
         self.find_similar_items_by_vector(&embedding, None, min_similarity, limit)
             .await
     }
@@ -1476,7 +1480,7 @@ fn detect_content_type(content: &str) -> ContentType {
 // ==================== Arrow Conversion Helpers ====================
 
 fn item_to_batch(item: &Item) -> Result<RecordBatch> {
-    let schema = Arc::new(item_schema());
+    let schema = Arc::new(item_schema(item.embedding.len()));
 
     let id = StringArray::from(vec![item.id.as_str()]);
     let content = StringArray::from(vec![item.content.as_str()]);
@@ -1577,7 +1581,7 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
 }
 
 fn chunk_to_batch(chunk: &Chunk) -> Result<RecordBatch> {
-    let schema = Arc::new(chunk_schema());
+    let schema = Arc::new(chunk_schema(chunk.embedding.len()));
 
     let id = StringArray::from(vec![chunk.id.as_str()]);
     let item_id = StringArray::from(vec![chunk.item_id.as_str()]);
@@ -1657,10 +1661,11 @@ fn batch_to_chunks(batch: &RecordBatch) -> Result<Vec<Chunk>> {
 }
 
 fn create_embedding_array(embedding: &[f32]) -> Result<FixedSizeListArray> {
+    let dim = embedding.len();
     let values = Float32Array::from(embedding.to_vec());
     let field = Arc::new(Field::new("item", DataType::Float32, true));
 
-    FixedSizeListArray::try_new(field, EMBEDDING_DIM as i32, Arc::new(values), None)
+    FixedSizeListArray::try_new(field, dim as i32, Arc::new(values), None)
         .map_err(|e| SedimentError::Database(format!("Failed to create vector: {}", e)))
 }
 
@@ -1833,6 +1838,8 @@ mod tests {
         assert!(version >= 2, "Schema version should be at least 2");
     }
 
+    use crate::embedder::EMBEDDING_DIM;
+
     /// Build the old item schema (v1) that included a `tags` column.
     fn old_item_schema() -> Schema {
         Schema::new(vec![
@@ -1932,7 +1939,7 @@ mod tests {
             .await
             .unwrap();
 
-        let schema = Arc::new(item_schema());
+        let schema = Arc::new(item_schema(EMBEDDING_DIM));
         db_conn
             .create_empty_table("items", schema)
             .execute()
@@ -2015,7 +2022,7 @@ mod tests {
             .await
             .unwrap();
 
-        let schema = Arc::new(item_schema());
+        let schema = Arc::new(item_schema(EMBEDDING_DIM));
         let vector_values = Float32Array::from(vec![0.0f32; EMBEDDING_DIM]);
         let vector_field = Arc::new(Field::new("item", DataType::Float32, true));
         let vector = FixedSizeListArray::try_new(
@@ -2089,7 +2096,7 @@ mod tests {
             .unwrap();
 
         // items_migrated (leftover from failed migration)
-        let new_schema = Arc::new(item_schema());
+        let new_schema = Arc::new(item_schema(EMBEDDING_DIM));
         db_conn
             .create_empty_table("items_migrated", new_schema)
             .execute()
@@ -2134,7 +2141,7 @@ mod tests {
             .await
             .unwrap();
 
-        let new_schema = Arc::new(item_schema());
+        let new_schema = Arc::new(item_schema(EMBEDDING_DIM));
 
         // items with new schema
         let vector_values = Float32Array::from(vec![0.0f32; EMBEDDING_DIM]);
