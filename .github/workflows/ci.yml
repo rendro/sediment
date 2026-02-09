@@ -27,6 +27,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -38,11 +43,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --verbose
-
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test
 
   lint:
     runs-on: ubuntu-latest
