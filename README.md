@@ -13,7 +13,7 @@ Combines vector search, a relationship graph, and access tracking into a unified
 - **Single binary, zero config** — no Docker, no Postgres, no Qdrant. Just `sediment`.
 - **50ms store, 103ms recall** — local embeddings and vector search at 1K items, no network round-trips.
 - **4-tool focused API** — `store`, `recall`, `list`, `forget`. That's it.
-- **Works everywhere** — macOS (Intel + ARM), Linux x86_64. All data stays on your machine.
+- **Works everywhere** — macOS (Intel + ARM), Linux x86_64, Windows x86_64. All data stays on your machine.
 
 ### Comparison
 
@@ -36,8 +36,11 @@ cargo install sediment-mcp
 brew tap rendro/tap
 brew install sediment
 
-# Via shell installer
+# Via shell installer (macOS/Linux)
 curl -fsSL https://raw.githubusercontent.com/rendro/sediment/main/install.sh | sh
+
+# Via PowerShell installer (Windows)
+irm https://raw.githubusercontent.com/rendro/sediment/main/install.ps1 | iex
 
 # From source
 cargo install --path .
@@ -195,8 +198,13 @@ Benchmarked against 5 alternatives with 1,000 memories and 200 queries. See [BEN
 
 ### Data Location
 
+**macOS / Linux:**
 - Vector store: `~/.sediment/data/`
 - Graph + access tracking: `~/.sediment/access.db`
+
+**Windows:**
+- Vector store: `%LOCALAPPDATA%\sediment\data\`
+- Graph + access tracking: `%LOCALAPPDATA%\sediment\access.db`
 
 Everything runs locally. Your data never leaves your machine.
 

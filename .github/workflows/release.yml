@@ -30,6 +30,9 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: sediment-x86_64-unknown-linux-musl
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: sediment-x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
 
@@ -58,7 +61,8 @@ jobs:
         if: ${{ !contains(matrix.target, 'musl') }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (Unix)
+        if: ${{ !contains(matrix.target, 'windows') }}
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/sediment dist/
@@ -67,6 +71,16 @@ jobs:
           cd ..
           shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
 
+      - name: Package (Windows)
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/sediment.exe dist/
+          Compress-Archive -Path dist/sediment.exe -DestinationPath ${{ matrix.name }}.zip
+          $hash = (Get-FileHash ${{ matrix.name }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.name }}.zip" | Out-File -Encoding ascii ${{ matrix.name }}.zip.sha256
+
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
         with:
@@ -74,6 +88,8 @@ jobs:
           files: |
             ${{ matrix.name }}.tar.gz
             ${{ matrix.name }}.tar.gz.sha256
+            ${{ matrix.name }}.zip
+            ${{ matrix.name }}.zip.sha256
 
   checksums:
     needs: build

@@ -111,17 +111,29 @@ impl std::fmt::Display for ListScope {
 
 /// Get the central database path.
 ///
-/// Returns `~/.sediment/data` or the path specified in `SEDIMENT_DB` environment variable.
+/// Returns `~/.sediment/data` on Unix, `%LOCALAPPDATA%\sediment\data` on Windows,
+/// or the path specified in `SEDIMENT_DB` environment variable.
 /// Note: LanceDB uses a directory, not a single file.
 pub fn central_db_path() -> PathBuf {
     if let Ok(path) = std::env::var("SEDIMENT_DB") {
         return PathBuf::from(path);
     }
 
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".sediment")
-        .join("data")
+    #[cfg(unix)]
+    {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".sediment")
+            .join("data")
+    }
+
+    #[cfg(windows)]
+    {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("sediment")
+            .join("data")
+    }
 }
 
 /// Project configuration stored in `.sediment/config`
@@ -265,6 +277,11 @@ fn write_config_atomic(
         serde_json::to_string_pretty(config).map_err(|e| std::io::Error::other(e.to_string()))?;
     let tmp_path = sediment_dir.join(format!("config.tmp.{}", std::process::id()));
     std::fs::write(&tmp_path, &content)?;
+
+    // On Windows, rename fails if destination exists — remove it first.
+    // This is not atomic but acceptable for a config file.
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(config_path);
 
     if let Err(e) = std::fs::rename(&tmp_path, config_path) {
         let _ = std::fs::remove_file(&tmp_path);
