@@ -95,6 +95,7 @@ The 4-tool API is defined in `src/mcp/tools.rs`:
 ### Store Parameters
 - `content` (required) — The content to store
 - `scope` (optional, default: "project") — Where to store: "project" or "global"
+- `replace_id` (optional) — ID of an existing item to replace. Atomically stores new content and deletes the old item, preserving graph lineage.
 
 ### Recall Parameters
 - `query` (required) — Semantic search query

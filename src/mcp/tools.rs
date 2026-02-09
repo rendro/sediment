@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::access::AccessTracker;
 use crate::consolidation::{ConsolidationQueue, spawn_consolidation};
-use crate::db::score_with_decay;
+use crate::db::{is_valid_id, score_with_decay};
 use crate::graph::GraphStore;
 use crate::item::{Item, ItemFilters};
 use crate::retry::{RetryConfig, with_retry};
@@ -43,6 +43,10 @@ pub fn get_tools() -> Vec<Tool> {
                 "enum": ["project", "global"],
                 "default": "project",
                 "description": "Where to store: 'project' (current project) or 'global' (all projects)"
+            },
+            "replace_id": {
+                "type": "string",
+                "description": "ID of an existing item to replace. Atomically stores new content and deletes the old item, preserving graph lineage."
             }
         });
 
@@ -67,7 +71,7 @@ pub fn get_tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "store".to_string(),
-            description: "Store content for later retrieval. Use for preferences, facts, reference material, docs, or any information worth remembering. Long content is automatically chunked for better search.".to_string(),
+            description: "Store content for later retrieval. Use for preferences, facts, reference material, docs, or any information worth remembering. Long content is automatically chunked for better search. Use replace_id to atomically replace an existing item.".to_string(),
             input_schema: store_schema,
         },
         Tool {
@@ -133,6 +137,8 @@ pub struct StoreParams {
     pub content: String,
     #[serde(default)]
     pub scope: Option<String>,
+    #[serde(default)]
+    pub replace_id: Option<String>,
     /// Override creation timestamp (Unix seconds). Benchmark builds only.
     #[cfg(feature = "bench")]
     #[serde(default)]
@@ -357,11 +363,54 @@ async fn execute_store(
                 }
             }
 
+            // Handle replace_id: delete old item, preserve graph lineage
+            let mut replaced = false;
+            if let Some(ref old_id) = params.replace_id {
+                if !is_valid_id(old_id) {
+                    tracing::warn!("replace_id is not a valid ID: {}", old_id);
+                } else {
+                    if let Err(e) = graph.add_supersedes_edge(&new_id, old_id) {
+                        tracing::warn!("replace: add_supersedes_edge failed: {}", e);
+                    }
+                    if let Err(e) = graph.transfer_edges(old_id, &new_id) {
+                        tracing::warn!("replace: transfer_edges failed: {}", e);
+                    }
+                    match db.delete_item(old_id).await {
+                        Ok(true) => {
+                            replaced = true;
+                        }
+                        Ok(false) => {
+                            tracing::warn!("replace: old item not found: {}", old_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("replace: delete_item failed: {}", e);
+                        }
+                    }
+                    if let Err(e) = graph.remove_node(old_id) {
+                        tracing::warn!("replace: remove_node failed: {}", e);
+                    }
+                }
+            }
+
+            let message = if replaced {
+                format!(
+                    "Stored in {} scope (replaced {})",
+                    scope,
+                    params.replace_id.as_deref().unwrap_or("")
+                )
+            } else {
+                format!("Stored in {} scope", scope)
+            };
+
             let mut result = json!({
                 "success": true,
                 "id": new_id,
-                "message": format!("Stored in {} scope", scope)
+                "message": message
             });
+
+            if replaced {
+                result["replaced_id"] = json!(params.replace_id);
+            }
 
             if !store_result.potential_conflicts.is_empty() {
                 let conflicts: Vec<Value> = store_result
@@ -1156,6 +1205,88 @@ mod tests {
         assert!(
             result.is_error == Some(true),
             "Should error with missing content"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires model download
+    async fn test_store_replace_id() {
+        let (ctx, _tmp) = setup_test_context().await;
+
+        // Store an item
+        let store_result = execute_tool(
+            &ctx,
+            "store",
+            Some(json!({ "content": "Original content to replace" })),
+        )
+        .await;
+        assert!(store_result.is_error.is_none(), "Store should succeed");
+        let text = &store_result.content[0].text;
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let old_id = parsed["id"].as_str().unwrap().to_string();
+
+        // Store with replace_id
+        let replace_result = execute_tool(
+            &ctx,
+            "store",
+            Some(json!({
+                "content": "Updated replacement content",
+                "replace_id": old_id
+            })),
+        )
+        .await;
+        assert!(replace_result.is_error.is_none(), "Replace should succeed");
+        let text = &replace_result.content[0].text;
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed["replaced_id"].is_string(),
+            "Should include replaced_id"
+        );
+        assert_eq!(parsed["replaced_id"].as_str().unwrap(), old_id);
+        assert!(
+            parsed["message"].as_str().unwrap().contains("replaced"),
+            "Message should mention replacement"
+        );
+
+        // Old item should be gone
+        let list_result = execute_tool(&ctx, "list", Some(json!({ "scope": "project" }))).await;
+        let text = &list_result.content[0].text;
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            parsed["count"], 1,
+            "Should have exactly 1 item after replace"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // requires model download
+    async fn test_store_replace_id_invalid() {
+        let (ctx, _tmp) = setup_test_context().await;
+
+        // Store with an invalid replace_id — should still succeed (non-fatal)
+        let result = execute_tool(
+            &ctx,
+            "store",
+            Some(json!({
+                "content": "Content with bad replace_id",
+                "replace_id": "not a valid id!@#$"
+            })),
+        )
+        .await;
+        assert!(
+            result.is_error.is_none(),
+            "Store should succeed even with invalid replace_id"
+        );
+        let text = &result.content[0].text;
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed["success"].as_bool().unwrap(),
+            "Should report success"
+        );
+        // Should NOT have replaced_id since the ID was invalid
+        assert!(
+            parsed.get("replaced_id").is_none(),
+            "Should not include replaced_id for invalid ID"
         );
     }
 }

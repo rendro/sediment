@@ -133,7 +133,7 @@ Go to **Settings > Tools > AI Assistant > MCP Servers**, click **+**, and add:
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
-| `store` | `content`, `scope?` | Save content to memory |
+| `store` | `content`, `scope?`, `replace_id?` | Save content to memory |
 | `recall` | `query`, `limit?` | Search by semantic similarity |
 | `list` | `limit?`, `scope?` | List stored items |
 | `forget` | `id` | Delete an item by ID |
