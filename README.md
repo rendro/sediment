@@ -154,6 +154,22 @@ sediment forget <id>              # Delete an item by ID
 
 All commands support `--json` for machine-readable output.
 
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SEDIMENT_DB` | `~/.sediment/data` | Override database path. Useful for ephemeral or isolated storage. |
+| `SEDIMENT_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Override embedding model (`all-MiniLM-L6-v2`, `bge-small-en-v1.5`). |
+
+Example — use a throwaway database for a task:
+
+```bash
+SEDIMENT_DB=/tmp/task-xyz sediment store "temporary context"
+SEDIMENT_DB=/tmp/task-xyz sediment recall "context"
+```
+
+The `--db` CLI flag takes the same value and overrides the env var if both are set.
+
 ## How It Works
 
 ### Two-Database Hybrid

@@ -72,6 +72,15 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 4. **Consolidation** (background): Queue candidates → >=0.95 similarity: merge (delete old, transfer edges, SUPERSEDES edge) → 0.85-0.95: link (RELATED edge)
 5. **Clustering** (periodic): Triangle detection in graph → CLUSTER_SIBLING edges
 
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SEDIMENT_DB` | `~/.sediment/data` | Override database path. Also available as `--db` CLI flag. Useful for ephemeral/isolated storage: `SEDIMENT_DB=/tmp/task sediment store "..."` |
+| `SEDIMENT_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Override embedding model. Options: `all-MiniLM-L6-v2`, `bge-small-en-v1.5` |
+
+Priority: `--db` flag > `SEDIMENT_DB` env var > default `~/.sediment/data`.
+
 ### Key Design Decisions
 
 - **Two-database hybrid**: LanceDB for vectors, SQLite for graph relationships + mutable counters
