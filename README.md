@@ -141,11 +141,18 @@ Go to **Settings > Tools > AI Assistant > MCP Servers**, click **+**, and add:
 ## CLI
 
 ```bash
-sediment           # Start MCP server
-sediment init      # Set up Claude Code integration
-sediment stats     # Show database statistics
-sediment list      # List stored items
+sediment                          # Start MCP server
+sediment init                     # Set up Claude Code integration
+sediment stats                    # Show database statistics
+sediment list                     # List stored items
+sediment list --scope global      # List global items
+sediment store "some content"     # Store content
+sediment store -                  # Store content from stdin
+sediment recall "search query"    # Search by semantic similarity
+sediment forget <id>              # Delete an item by ID
 ```
+
+All commands support `--json` for machine-readable output.
 
 ## How It Works
 

@@ -15,9 +15,15 @@ cargo run --release
 cargo run --release -- --verbose
 
 # Run CLI commands
-cargo run --release -- init          # Initialize project
-cargo run --release -- stats         # Show database statistics
-cargo run --release -- list          # List stored items
+cargo run --release -- init                     # Initialize project
+cargo run --release -- stats                    # Show database statistics
+cargo run --release -- list                     # List stored items
+cargo run --release -- list --scope global      # List global items
+cargo run --release -- store "some content"     # Store content
+cargo run --release -- store -                  # Store from stdin
+cargo run --release -- recall "search query"    # Semantic search
+cargo run --release -- forget <id>              # Delete an item
+cargo run --release -- --json list              # JSON output (any command)
 
 # Run tests (requires model download on first run)
 cargo test
@@ -38,7 +44,7 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 
 ### Core Components
 
-- **`src/main.rs`** - CLI entry point with subcommands (init, stats, list) and MCP server startup
+- **`src/main.rs`** - CLI entry point with subcommands (init, stats, list, store, recall, forget) and MCP server startup
 - **`src/lib.rs`** - Library root exposing public API, project detection, scope types, and project ID migration
 - **`src/db.rs`** - LanceDB wrapper handling vector storage, hybrid search (vector + FTS/BM25), and CRUD operations
 - **`src/embedder.rs`** - Local embeddings using `all-MiniLM-L6-v2` via Candle (384-dim vectors)

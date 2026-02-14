@@ -3,10 +3,12 @@
 //! Semantic memory for AI agents - local-first, MCP-native.
 //! Run this binary to start the MCP server.
 
+use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde_json::json;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser)]
@@ -21,6 +23,10 @@ struct Cli {
     /// Enable verbose output
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Output JSON instead of human-readable text
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -42,11 +48,45 @@ enum Commands {
     /// Show database statistics (item count, chunk count)
     Stats,
 
-    /// List stored items for debugging
+    /// List stored items
     List {
         /// Maximum number of items to show
         #[arg(short, long, default_value = "20")]
         limit: usize,
+
+        /// Scope: "project" (default), "global", or "all"
+        #[arg(short, long, default_value = "project")]
+        scope: String,
+    },
+
+    /// Store content for later retrieval
+    Store {
+        /// Content to store (use "-" to read from stdin)
+        content: String,
+
+        /// Scope: "project" (default) or "global"
+        #[arg(short, long, default_value = "project")]
+        scope: String,
+
+        /// ID of an existing item to replace
+        #[arg(long)]
+        replace: Option<String>,
+    },
+
+    /// Search stored content by semantic similarity
+    Recall {
+        /// Search query
+        query: String,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+    },
+
+    /// Delete a stored item by its ID
+    Forget {
+        /// Item ID to delete
+        id: String,
     },
 }
 
@@ -77,7 +117,14 @@ fn main() -> Result<()> {
         None => run_mcp_server(cli.db),
         Some(Commands::Init { local, global }) => run_init(local, global),
         Some(Commands::Stats) => run_stats(cli.db),
-        Some(Commands::List { limit }) => run_list(cli.db, limit),
+        Some(Commands::List { limit, scope }) => run_list(cli.db, limit, &scope, cli.json),
+        Some(Commands::Store {
+            content,
+            scope,
+            replace,
+        }) => run_store(cli.db, &content, &scope, replace, cli.json),
+        Some(Commands::Recall { query, limit }) => run_recall(cli.db, &query, limit, cli.json),
+        Some(Commands::Forget { id }) => run_forget(cli.db, &id, cli.json),
     }
 }
 
@@ -320,19 +367,89 @@ fn run_stats(db_override: Option<PathBuf>) -> Result<()> {
     })
 }
 
-/// List stored items
-fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
-    let db_path = db_override.unwrap_or_else(sediment::central_db_path);
+/// Shared context for CLI commands that need database access.
+struct CliContext {
+    db_path: PathBuf,
+    access_db_path: PathBuf,
+    project_id: Option<String>,
+}
 
-    if !db_path.exists() {
-        println!("Database does not exist yet.");
+/// Build CLI context: resolve DB path, detect project, derive project ID.
+fn cli_context(db_override: Option<PathBuf>) -> CliContext {
+    let db_path = db_override.unwrap_or_else(sediment::central_db_path);
+    let sediment_dir = db_path.parent().unwrap_or(&db_path);
+    let access_db_path = sediment_dir.join("access.db");
+
+    let cwd = std::env::current_dir().ok();
+    let project_root = cwd
+        .as_deref()
+        .map(|dir| sediment::find_project_root(dir).unwrap_or_else(|| dir.to_path_buf()));
+    let project_id = project_root
+        .as_ref()
+        .and_then(|root| sediment::get_or_create_project_id(root).ok());
+
+    CliContext {
+        db_path,
+        access_db_path,
+        project_id,
+    }
+}
+
+/// List stored items
+fn run_list(
+    db_override: Option<PathBuf>,
+    limit: usize,
+    scope: &str,
+    output_json: bool,
+) -> Result<()> {
+    let ctx = cli_context(db_override);
+
+    if !ctx.db_path.exists() {
+        if output_json {
+            println!("{}", json!({"count": 0, "items": []}));
+        } else {
+            println!("Database does not exist yet.");
+        }
         return Ok(());
     }
 
+    let scope = scope
+        .parse::<sediment::ListScope>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let mut db = sediment::Database::open(&db_path).await?;
-        let items = db.list_items(Some(limit), sediment::ListScope::All).await?;
+        let mut db = sediment::Database::open_with_project(&ctx.db_path, ctx.project_id).await?;
+        let items = db.list_items(Some(limit), scope).await?;
+
+        if output_json {
+            let formatted: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| {
+                    let mut obj = json!({
+                        "id": item.id,
+                        "content": item.content,
+                        "created": item.created_at.to_rfc3339(),
+                    });
+                    if item.project_id.is_some() {
+                        obj["scope"] = json!("project");
+                    } else {
+                        obj["scope"] = json!("global");
+                    }
+                    if item.is_chunked {
+                        obj["chunked"] = json!(true);
+                    }
+                    obj
+                })
+                .collect();
+
+            let result = json!({
+                "count": items.len(),
+                "items": formatted
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
 
         if items.is_empty() {
             println!("No items stored.");
@@ -364,6 +481,379 @@ fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
             println!("  {} ({})", item.id, scope);
             println!("    {}{}", content_preview, ellipsis);
             println!();
+        }
+
+        Ok(())
+    })
+}
+
+/// Store content
+fn run_store(
+    db_override: Option<PathBuf>,
+    content: &str,
+    scope: &str,
+    replace: Option<String>,
+    output_json: bool,
+) -> Result<()> {
+    let ctx = cli_context(db_override);
+
+    // Read content from stdin if "-"
+    let content = if content == "-" {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        content.to_string()
+    };
+
+    if content.trim().is_empty() {
+        anyhow::bail!("Content must not be empty");
+    }
+
+    let scope = scope
+        .parse::<sediment::StoreScope>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut db = sediment::Database::open_with_project(&ctx.db_path, ctx.project_id.clone()).await?;
+
+        let mut item = sediment::Item::new(&content);
+
+        // Set project_id based on scope
+        if scope == sediment::StoreScope::Project
+            && let Some(ref project_id) = ctx.project_id
+        {
+            item = item.with_project_id(project_id);
+        }
+
+        let store_result = db.store_item(item).await?;
+        let new_id = store_result.id.clone();
+
+        // Create graph node
+        let graph = sediment::graph::GraphStore::open(&ctx.access_db_path)?;
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = graph.add_node(&new_id, ctx.project_id.as_deref(), now) {
+            tracing::warn!("graph add_node failed: {}", e);
+        }
+
+        // Enqueue consolidation candidates from conflicts
+        if !store_result.potential_conflicts.is_empty()
+            && let Ok(queue) =
+                sediment::consolidation::ConsolidationQueue::open(&ctx.access_db_path)
+        {
+            for conflict in &store_result.potential_conflicts {
+                if let Err(e) =
+                    queue.enqueue(&new_id, &conflict.id, conflict.similarity as f64)
+                {
+                    tracing::warn!("enqueue consolidation failed: {}", e);
+                }
+            }
+        }
+
+        // Handle replace: delete old item, preserve graph lineage
+        let mut replaced = false;
+        if let Some(ref old_id) = replace {
+            if !sediment::db::is_valid_id(old_id) {
+                tracing::warn!("replace ID is not valid: {}", old_id);
+            } else {
+                if let Err(e) = graph.add_supersedes_edge(&new_id, old_id) {
+                    tracing::warn!("replace: add_supersedes_edge failed: {}", e);
+                }
+                if let Err(e) = graph.transfer_edges(old_id, &new_id) {
+                    tracing::warn!("replace: transfer_edges failed: {}", e);
+                }
+
+                // Record validation on the new item
+                if let Ok(tracker) =
+                    sediment::access::AccessTracker::open(&ctx.access_db_path)
+                {
+                    let created_at = chrono::Utc::now().timestamp();
+                    if let Err(e) = tracker.record_validation(&new_id, created_at) {
+                        tracing::warn!("replace: record_validation failed: {}", e);
+                    }
+                }
+
+                match db.delete_item(old_id).await {
+                    Ok(true) => replaced = true,
+                    Ok(false) => tracing::warn!("replace: old item not found: {}", old_id),
+                    Err(e) => tracing::warn!("replace: delete_item failed: {}", e),
+                }
+                if let Err(e) = graph.remove_node(old_id) {
+                    tracing::warn!("replace: remove_node failed: {}", e);
+                }
+            }
+        }
+
+        if output_json {
+            let mut result = json!({
+                "success": true,
+                "id": new_id,
+                "scope": scope.to_string(),
+            });
+
+            if replaced {
+                result["replaced_id"] = json!(replace);
+            }
+
+            if !store_result.potential_conflicts.is_empty() {
+                let conflicts: Vec<serde_json::Value> = store_result
+                    .potential_conflicts
+                    .iter()
+                    .map(|c| json!({"id": c.id, "content": c.content, "similarity": format!("{:.2}", c.similarity)}))
+                    .collect();
+                result["potential_conflicts"] = json!(conflicts);
+            }
+
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            let header = if replaced {
+                format!("Stored (replaced {}):", replace.as_deref().unwrap_or(""))
+            } else {
+                "Stored:".to_string()
+            };
+            println!("{}", header);
+            println!("  ID:    {}", new_id);
+            println!("  Scope: {}", scope);
+
+            if !store_result.potential_conflicts.is_empty() {
+                println!("\n  Potential conflicts:");
+                for c in &store_result.potential_conflicts {
+                    let preview: String = c.content.chars().take(60).collect::<String>().replace('\n', " ");
+                    println!("    {} (similarity: {:.2})", c.id, c.similarity);
+                    println!("      {}", preview);
+                }
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Search stored content
+fn run_recall(
+    db_override: Option<PathBuf>,
+    query: &str,
+    limit: usize,
+    output_json: bool,
+) -> Result<()> {
+    let ctx = cli_context(db_override);
+
+    if !ctx.db_path.exists() {
+        if output_json {
+            println!("{}", json!({"count": 0, "results": []}));
+        } else {
+            println!("No items found matching your query.");
+        }
+        return Ok(());
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut db =
+            sediment::Database::open_with_project(&ctx.db_path, ctx.project_id.clone()).await?;
+
+        let tracker = sediment::access::AccessTracker::open(&ctx.access_db_path)?;
+        let graph = sediment::graph::GraphStore::open(&ctx.access_db_path)?;
+
+        let filters = sediment::ItemFilters::new();
+        let config = sediment::mcp::tools::RecallConfig {
+            enable_background_tasks: false,
+            ..Default::default()
+        };
+
+        let recall_result = sediment::mcp::tools::recall_pipeline(
+            &mut db, &tracker, &graph, query, limit, filters, &config,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+        if output_json {
+            // Batch-fetch neighbors for related_ids
+            let all_result_ids: Vec<&str> = recall_result
+                .results
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect();
+            let neighbors_map = graph
+                .get_neighbors_mapped(&all_result_ids, 0.5)
+                .unwrap_or_default();
+
+            let formatted: Vec<serde_json::Value> = recall_result
+                .results
+                .iter()
+                .map(|r| {
+                    let mut obj = json!({
+                        "id": r.id,
+                        "content": r.content,
+                        "similarity": format!("{:.2}", r.similarity),
+                        "created": r.created_at.to_rfc3339(),
+                    });
+                    if let Some(&raw_sim) = recall_result.raw_similarities.get(&r.id)
+                        && (raw_sim - r.similarity).abs() > 0.001
+                    {
+                        obj["raw_similarity"] = json!(format!("{:.2}", raw_sim));
+                    }
+                    if let Some(ref excerpt) = r.relevant_excerpt {
+                        obj["relevant_excerpt"] = json!(excerpt);
+                    }
+                    if let Some(ref current_pid) = ctx.project_id
+                        && let Some(ref item_pid) = r.project_id
+                        && item_pid != current_pid
+                    {
+                        obj["cross_project"] = json!(true);
+                    }
+                    if let Some(related) = neighbors_map.get(&r.id)
+                        && !related.is_empty()
+                    {
+                        obj["related_ids"] = json!(related);
+                    }
+                    obj
+                })
+                .collect();
+
+            let mut result = json!({
+                "count": recall_result.results.len(),
+                "results": formatted,
+            });
+
+            if !recall_result.graph_expanded.is_empty() {
+                result["graph_expanded"] = json!(recall_result.graph_expanded);
+            }
+            if !recall_result.suggested.is_empty() {
+                result["suggested"] = json!(recall_result.suggested);
+            }
+
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
+
+        // Human-readable output
+        if recall_result.results.is_empty() {
+            println!("No items found matching your query.");
+            return Ok(());
+        }
+
+        println!("Results ({}):\n", recall_result.results.len());
+        for r in &recall_result.results {
+            println!("  {} (similarity: {:.2})", r.id, r.similarity);
+
+            // Show raw similarity if decay scoring changed it
+            if let Some(&raw_sim) = recall_result.raw_similarities.get(&r.id)
+                && (raw_sim - r.similarity).abs() > 0.001
+            {
+                println!("    raw similarity: {:.2}", raw_sim);
+            }
+
+            let content_preview: String = r
+                .content
+                .chars()
+                .take(80)
+                .collect::<String>()
+                .replace('\n', " ");
+            let ellipsis = if r.content.chars().count() > 80 {
+                "..."
+            } else {
+                ""
+            };
+            println!("    {}{}", content_preview, ellipsis);
+
+            if let Some(ref excerpt) = r.relevant_excerpt {
+                let excerpt_preview: String = excerpt
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+                    .replace('\n', " ");
+                let ellipsis = if excerpt.chars().count() > 80 {
+                    "..."
+                } else {
+                    ""
+                };
+                println!("    excerpt: {}{}", excerpt_preview, ellipsis);
+            }
+
+            println!();
+        }
+
+        if !recall_result.graph_expanded.is_empty() {
+            println!("Graph-expanded:");
+            for entry in &recall_result.graph_expanded {
+                if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                    let rel = entry
+                        .get("rel_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("related");
+                    println!("  {} (via {})", id, rel);
+                }
+            }
+            println!();
+        }
+
+        if !recall_result.suggested.is_empty() {
+            println!("Suggested:");
+            for entry in &recall_result.suggested {
+                if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                    let reason = entry.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("  {} — {}", id, reason);
+                }
+            }
+            println!();
+        }
+
+        Ok(())
+    })
+}
+
+/// Delete a stored item
+fn run_forget(db_override: Option<PathBuf>, id: &str, output_json: bool) -> Result<()> {
+    let ctx = cli_context(db_override);
+
+    if !ctx.db_path.exists() {
+        anyhow::bail!("Database does not exist yet.");
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let db =
+            sediment::Database::open_with_project(&ctx.db_path, ctx.project_id.clone()).await?;
+
+        // Access control: verify the item belongs to the current project or is global
+        if let Some(ref current_pid) = ctx.project_id {
+            match db.get_item(id).await {
+                Ok(Some(item)) => {
+                    if let Some(ref item_pid) = item.project_id
+                        && item_pid != current_pid
+                    {
+                        anyhow::bail!("Cannot delete item {} from a different project", id);
+                    }
+                }
+                Ok(None) => anyhow::bail!("Item not found: {}", id),
+                Err(e) => anyhow::bail!("Failed to look up item: {}", e),
+            }
+        }
+
+        match db.delete_item(id).await {
+            Ok(true) => {
+                // Remove from graph
+                let graph = sediment::graph::GraphStore::open(&ctx.access_db_path)?;
+                if let Err(e) = graph.remove_node(id) {
+                    tracing::warn!("remove_node failed: {}", e);
+                }
+
+                if output_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "success": true,
+                            "message": format!("Deleted item: {}", id),
+                        }))?
+                    );
+                } else {
+                    println!("Deleted item: {}", id);
+                }
+            }
+            Ok(false) => anyhow::bail!("Item not found: {}", id),
+            Err(e) => anyhow::bail!("Failed to delete item: {}", e),
         }
 
         Ok(())

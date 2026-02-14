@@ -28,7 +28,7 @@ fn sanitize_sql_string(s: &str) -> String {
 /// Validate that a string looks like a valid item/project ID (UUID hex + hyphens).
 /// Returns true if the string only contains safe characters for SQL interpolation.
 /// Use this as an additional guard before `sanitize_sql_string` for ID fields.
-pub(crate) fn is_valid_id(s: &str) -> bool {
+pub fn is_valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
