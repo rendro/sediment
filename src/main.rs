@@ -15,8 +15,16 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[command(name = "sediment")]
 #[command(about = "Semantic memory for AI agents - local-first, MCP-native")]
 #[command(version)]
+#[command(after_long_help = "\
+Environment variables:
+  SEDIMENT_DB              Override database path (default: ~/.sediment/data).
+                           Useful for ephemeral/isolated storage:
+                             SEDIMENT_DB=/tmp/task-xyz sediment store \"...\"
+  SEDIMENT_EMBEDDING_MODEL Override embedding model (default: all-MiniLM-L6-v2).
+                           Options: all-MiniLM-L6-v2, bge-small-en-v1.5
+")]
 struct Cli {
-    /// Database path (defaults to ~/.sediment/data)
+    /// Database path [default: ~/.sediment/data]
     #[arg(long, global = true, env = "SEDIMENT_DB")]
     db: Option<PathBuf>,
 

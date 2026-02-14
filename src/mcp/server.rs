@@ -231,6 +231,19 @@ fn handle_request(rt: &Runtime, ctx: &ServerContext, line: &str) -> Option<Respo
 
 /// Handle initialize request
 fn handle_initialize(id: Option<Value>) -> Response {
+    let instructions = "\
+Sediment is a local-first semantic memory system. All data stays on disk — no API keys required.
+
+Environment variables (set before starting the server or CLI):
+- SEDIMENT_DB: Override database path (default: ~/.sediment/data). \
+Useful for ephemeral or isolated storage, e.g. SEDIMENT_DB=/tmp/task-xyz sediment store \"...\".
+- SEDIMENT_EMBEDDING_MODEL: Override embedding model (default: all-MiniLM-L6-v2). \
+Options: all-MiniLM-L6-v2, bge-small-en-v1.5.
+
+Sediment is also available as a CLI: sediment store, sediment recall, sediment list, sediment forget. \
+Run `sediment --help` for details."
+        .to_string();
+
     let result = InitializeResult {
         protocol_version: MCP_VERSION.to_string(),
         capabilities: ServerCapabilities {
@@ -242,6 +255,7 @@ fn handle_initialize(id: Option<Value>) -> Response {
             name: "sediment".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
+        instructions: Some(instructions),
     };
 
     // InitializeResult is a simple struct; serialization is infallible.
