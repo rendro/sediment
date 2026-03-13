@@ -129,6 +129,21 @@ Go to **Settings > Tools > AI Assistant > MCP Servers**, click **+**, and add:
 }
 ```
 
+### Zed
+
+Add to `~/.zed/settings.json` on macOS or `~/.config/zed/settings.json` on Linux:
+
+```json
+{
+  "context_servers": {
+    "sediment": {
+      "command": "sediment",
+      "args": [],
+    }
+  }
+}
+```
+
 ## Tools
 
 | Tool | Parameters | Description |
