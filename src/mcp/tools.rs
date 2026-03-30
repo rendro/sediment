@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::access::AccessTracker;
+use crate::compaction::spawn_compaction;
 use crate::consolidation::{ConsolidationQueue, spawn_consolidation};
 use crate::db::{is_valid_id, score_with_decay};
 use crate::graph::GraphStore;
@@ -27,6 +28,21 @@ fn spawn_logged(name: &'static str, fut: impl std::future::Future<Output = ()> +
             tracing::error!("Background task '{}' panicked: {:?}", name, e);
         }
     });
+}
+
+/// Increment the write counter and spawn background compaction every 50 writes.
+fn maybe_spawn_compaction(ctx: &ServerContext) {
+    let count = ctx
+        .write_count
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if count % 50 == 49 {
+        spawn_compaction(
+            Arc::new(ctx.db_path.clone()),
+            ctx.project_id.clone(),
+            ctx.embedder.clone(),
+            ctx.compaction_semaphore.clone(),
+        );
+    }
 }
 
 /// Get all available tools (4 total)
@@ -391,6 +407,9 @@ async fn execute_store(
                     }
                 }
             }
+
+            // Periodic compaction: every 50 write operations
+            maybe_spawn_compaction(ctx);
 
             let message = if replaced {
                 format!(
@@ -909,6 +928,9 @@ async fn execute_forget(
                 tracing::warn!("remove_node failed: {}", e);
             }
 
+            // Periodic compaction: every 50 write operations
+            maybe_spawn_compaction(ctx);
+
             let result = json!({
                 "success": true,
                 "message": format!("Deleted item: {}", params.id)
@@ -998,7 +1020,9 @@ mod tests {
             embedder,
             cwd: PathBuf::from("."),
             consolidation_semaphore: Arc::new(Semaphore::new(1)),
+            compaction_semaphore: Arc::new(Semaphore::new(1)),
             recall_count: std::sync::atomic::AtomicU64::new(0),
+            write_count: std::sync::atomic::AtomicU64::new(0),
             rate_limit: Mutex::new(super::super::server::RateLimitState {
                 window_start_ms: 0,
                 count: 0,

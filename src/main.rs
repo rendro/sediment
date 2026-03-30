@@ -96,6 +96,17 @@ enum Commands {
         /// Item ID to delete
         id: String,
     },
+
+    /// Compact and optimize LanceDB storage (reclaim disk space)
+    Compact {
+        /// Also delete unverified files (less than 7 days old)
+        #[arg(long)]
+        force: bool,
+
+        /// Skip the prune phase (only compact and re-index)
+        #[arg(long)]
+        no_prune: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -133,6 +144,7 @@ fn main() -> Result<()> {
         }) => run_store(cli.db, &content, &scope, replace, cli.json),
         Some(Commands::Recall { query, limit }) => run_recall(cli.db, &query, limit, cli.json),
         Some(Commands::Forget { id }) => run_forget(cli.db, &id, cli.json),
+        Some(Commands::Compact { force, no_prune }) => run_compact(cli.db, force, no_prune),
     }
 }
 
@@ -524,7 +536,8 @@ fn run_store(
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let mut db = sediment::Database::open_with_project(&ctx.db_path, ctx.project_id.clone()).await?;
+        let mut db =
+            sediment::Database::open_with_project(&ctx.db_path, ctx.project_id.clone()).await?;
 
         let mut item = sediment::Item::new(&content);
 
@@ -866,6 +879,95 @@ fn run_forget(db_override: Option<PathBuf>, id: &str, output_json: bool) -> Resu
 
         Ok(())
     })
+}
+
+/// Compact and optimize LanceDB storage
+fn run_compact(db_override: Option<PathBuf>, force: bool, no_prune: bool) -> Result<()> {
+    let db_path = db_override.unwrap_or_else(sediment::central_db_path);
+
+    if !db_path.exists() {
+        println!("Database does not exist yet. Nothing to compact.");
+        return Ok(());
+    }
+
+    println!("Database: {}", db_path.display());
+
+    let size_before = sediment::db::dir_size(&db_path);
+    println!("Size before: {}", format_bytes(size_before));
+
+    let config = sediment::db::CompactConfig {
+        prune_older_than: if no_prune {
+            None
+        } else {
+            Some(chrono::Duration::zero())
+        },
+        delete_unverified: force,
+        num_threads: None, // use all CPUs for CLI
+        skip_prune: no_prune,
+    };
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let db = sediment::Database::open(&db_path).await?;
+        let stats = db.optimize_tables(&config).await?;
+
+        let size_after = sediment::db::dir_size(&db_path);
+
+        println!("\nOptimization results:");
+        println!(
+            "  Items table:  {}",
+            if stats.items_compacted {
+                "compacted"
+            } else {
+                "no changes needed"
+            }
+        );
+        println!(
+            "  Chunks table: {}",
+            if stats.chunks_compacted {
+                "compacted"
+            } else {
+                "no changes needed"
+            }
+        );
+
+        if !no_prune {
+            println!(
+                "  Items pruned:  {}",
+                if stats.items_pruned { "yes" } else { "no" }
+            );
+            println!(
+                "  Chunks pruned: {}",
+                if stats.chunks_pruned { "yes" } else { "no" }
+            );
+        }
+
+        println!("\nSize after:  {}", format_bytes(size_after));
+
+        if size_before > size_after {
+            println!("Reclaimed:   {}", format_bytes(size_before - size_after));
+        } else {
+            println!("No space reclaimed (storage is already optimized)");
+        }
+
+        Ok(())
+    })
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} bytes", bytes)
+    }
 }
 
 /// Generate CLAUDE.md instructions for Sediment

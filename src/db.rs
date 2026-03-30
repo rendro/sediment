@@ -1310,6 +1310,143 @@ impl Database {
 
         Ok(stats)
     }
+
+    /// Optimize on-disk storage: compact fragments, prune old versions, and rebuild indices.
+    ///
+    /// LanceDB is append-only: every store, delete, and update creates new data files.
+    /// This method reclaims space by merging small fragments, materializing deletions,
+    /// and removing old dataset versions.
+    pub async fn optimize_tables(&self, config: &CompactConfig) -> Result<CompactStats> {
+        let mut stats = CompactStats::default();
+
+        for (label, table) in [("items", &self.items_table), ("chunks", &self.chunks_table)] {
+            let Some(table) = table else { continue };
+
+            // Phase 1: Compact — merge small files, materialize deletions
+            let compact_opts = lancedb::table::CompactionOptions {
+                target_rows_per_fragment: 1024,
+                materialize_deletions: true,
+                materialize_deletions_threshold: 0.0,
+                num_threads: config.num_threads,
+                ..Default::default()
+            };
+            match table
+                .optimize(lancedb::table::OptimizeAction::Compact {
+                    options: compact_opts,
+                    remap_options: None,
+                })
+                .await
+            {
+                Ok(s) => {
+                    if let Some(ref c) = s.compaction {
+                        info!(
+                            "{} compaction: {} fragments removed, {} new, {} files removed",
+                            label, c.fragments_removed, c.fragments_added, c.files_removed,
+                        );
+                    }
+                    match label {
+                        "items" => stats.items_compacted = s.compaction.is_some(),
+                        "chunks" => stats.chunks_compacted = s.compaction.is_some(),
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("{} compaction failed: {}", label, e);
+                }
+            }
+
+            // Phase 2: Prune — remove old dataset versions
+            if !config.skip_prune {
+                let older_than = config.prune_older_than;
+                match table
+                    .optimize(lancedb::table::OptimizeAction::Prune {
+                        older_than,
+                        delete_unverified: Some(config.delete_unverified),
+                        error_if_tagged_old_versions: None,
+                    })
+                    .await
+                {
+                    Ok(s) => {
+                        if let Some(ref p) = s.prune {
+                            info!(
+                                "{} prune: {} bytes removed, {} old versions removed",
+                                label, p.bytes_removed, p.old_versions,
+                            );
+                        }
+                        match label {
+                            "items" => stats.items_pruned = s.prune.is_some(),
+                            "chunks" => stats.chunks_pruned = s.prune.is_some(),
+                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("{} prune failed: {}", label, e);
+                    }
+                }
+            }
+
+            // Phase 3: Index — optimize indices for new data
+            match table
+                .optimize(lancedb::table::OptimizeAction::Index(
+                    lancedb::table::OptimizeOptions::default(),
+                ))
+                .await
+            {
+                Ok(_) => {
+                    info!("{} index optimization complete", label);
+                }
+                Err(e) => {
+                    tracing::warn!("{} index optimization failed: {}", label, e);
+                }
+            }
+        }
+
+        Ok(stats)
+    }
+}
+
+/// Configuration for table optimization.
+#[derive(Debug, Clone, Default)]
+pub struct CompactConfig {
+    /// Minimum age of versions to prune. None uses Duration::ZERO (prune all).
+    pub prune_older_than: Option<chrono::Duration>,
+    /// Whether to delete unverified files (files created less than 7 days ago).
+    pub delete_unverified: bool,
+    /// Number of threads for compaction. None uses all available CPUs.
+    pub num_threads: Option<usize>,
+    /// Skip the prune phase entirely.
+    pub skip_prune: bool,
+}
+
+/// Results from table optimization.
+#[derive(Debug, Default)]
+pub struct CompactStats {
+    pub items_compacted: bool,
+    pub chunks_compacted: bool,
+    pub items_pruned: bool,
+    pub chunks_pruned: bool,
+}
+
+/// Measure the total size (in bytes) of all files in a directory tree.
+pub fn dir_size(path: &std::path::Path) -> u64 {
+    walkdir(path)
+}
+
+fn walkdir(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let ft = entry.file_type();
+            if let Ok(ft) = ft {
+                if ft.is_file() {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                } else if ft.is_dir() {
+                    total += walkdir(&entry.path());
+                }
+            }
+        }
+    }
+    total
 }
 
 // ==================== Project ID Migration ====================

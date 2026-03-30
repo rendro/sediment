@@ -39,8 +39,12 @@ pub struct ServerContext {
     pub cwd: PathBuf,
     /// Semaphore to ensure only one consolidation task runs at a time
     pub consolidation_semaphore: Arc<Semaphore>,
+    /// Semaphore to ensure only one compaction task runs at a time
+    pub compaction_semaphore: Arc<Semaphore>,
     /// Counter for recall invocations (triggers periodic clustering and expired cleanup)
     pub recall_count: std::sync::atomic::AtomicU64,
+    /// Counter for write operations (store/forget) that trigger periodic compaction
+    pub write_count: std::sync::atomic::AtomicU64,
     /// Rate limiter state (mutex protects window+count as a unit)
     pub rate_limit: Mutex<RateLimitState>,
 }
@@ -70,7 +74,9 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
         embedder,
         cwd,
         consolidation_semaphore: Arc::new(Semaphore::new(1)),
+        compaction_semaphore: Arc::new(Semaphore::new(1)),
         recall_count: std::sync::atomic::AtomicU64::new(0),
+        write_count: std::sync::atomic::AtomicU64::new(0),
         rate_limit: Mutex::new(RateLimitState {
             window_start_ms: 0,
             count: 0,
@@ -163,11 +169,16 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
         }
     }
 
-    // Graceful shutdown: wait for in-flight consolidation before dropping
+    // Graceful shutdown: wait for in-flight background tasks before dropping
     tracing::info!("Client disconnected, shutting down...");
-    let sem = ctx.consolidation_semaphore.clone();
+    let consol_sem = ctx.consolidation_semaphore.clone();
+    let compact_sem = ctx.compaction_semaphore.clone();
     let _ = rt.block_on(async {
-        tokio::time::timeout(std::time::Duration::from_secs(10), sem.acquire()).await
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let _ = consol_sem.acquire().await;
+            let _ = compact_sem.acquire().await;
+        })
+        .await
     });
     drop(ctx);
     rt.shutdown_timeout(std::time::Duration::from_secs(5));
